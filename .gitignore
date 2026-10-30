@@ -1,0 +1,10 @@
+node_modules/
+dist/
+dist-e2e/
+coverage/
+test-results/
+playwright-report/
+e2e/fixtures/*.wav
+certs/
+*.tsbuildinfo
+.DS_Store

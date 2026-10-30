@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.worklet.tsbuildinfo",
+    "lib": ["ES2023"],
+    "types": ["audioworklet"]
+  },
+  "include": ["src/worklet", "src/dsp", "src/audio/protocol.ts"]
+}

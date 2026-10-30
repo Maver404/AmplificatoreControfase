@@ -1,0 +1,29 @@
+# Avvio:  docker compose up --build
+#   http://localhost:8080    (localhost è un contesto sicuro: il microfono funziona anche in HTTP)
+#   https://localhost:8443   (certificato autofirmato generato all'avvio, oppure il tuo in ./certs)
+# Uso da un altro dispositivo in LAN: serve HTTPS con l'IP del computer nel certificato, es.
+#   EXTRA_SAN="IP:192.168.1.10,DNS:mypc.local" docker compose up --build
+# (oppure scrivi EXTRA_SAN=... in un file .env accanto a questo file). Dettagli nel README.
+services:
+  controfase:
+    build: .
+    image: amplificatore-controfase:local
+    ports:
+      # Pubblicate su tutte le interfacce (serve per la LAN). Solo su questo computer:
+      # "127.0.0.1:8080:80" e "127.0.0.1:8443:443".
+      - "8080:80"
+      - "8443:443"
+    environment:
+      # Nomi/indirizzi aggiuntivi nel certificato autofirmato, separati da virgole: IP:... o DNS:...
+      EXTRA_SAN: ${EXTRA_SAN:-}
+    # Certificato tuo (opzionale): metti server.crt e server.key (PEM, chiave senza passphrase)
+    # nella cartella ./certs e togli il commento alle due righe seguenti. Sono commentate perché,
+    # se ./certs non esiste, Docker creerebbe al suo posto una cartella vuota di proprietà di root.
+    # volumes:
+    #   - ./certs:/etc/nginx/certs:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

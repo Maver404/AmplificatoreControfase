@@ -1,0 +1,534 @@
+/* Configurazione guidata (src/ui/wizard). Uses the theme tokens of src/styles.css. */
+
+.wizard,
+.wz-card {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+}
+
+.wz-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.wz-title {
+  font-size: 1.15rem;
+  font-weight: 700;
+}
+
+.wz-card {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+
+.wz-card .wz-title {
+  grid-column: 1 / -1;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+}
+
+.wz-card-text {
+  color: var(--text-muted);
+}
+
+@media (max-width: 560px) {
+  .wz-card {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ---- stepper ---- */
+
+.wz-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: none;
+}
+
+.wz-steps-chip,
+.wz-steps-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3em;
+  min-height: 30px;
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 0.82rem;
+  background: var(--surface-2);
+  color: var(--text-muted);
+}
+
+.wz-steps-link {
+  font: inherit;
+  font-size: 0.82rem;
+  cursor: pointer;
+  color: var(--ok);
+  border-color: var(--ok);
+  background: var(--ok-bg);
+}
+
+.wz-steps-link:hover {
+  text-decoration: underline;
+}
+
+.wz-steps-item--done > .wz-steps-chip {
+  color: var(--ok);
+  border-color: var(--ok);
+  background: var(--ok-bg);
+}
+
+.wz-steps-item--current > .wz-steps-chip {
+  color: var(--accent-contrast);
+  background: var(--accent);
+  border-color: var(--accent);
+  font-weight: 700;
+}
+
+@media (max-width: 560px) {
+  .wz-steps-item:not(.wz-steps-item--current) .wz-steps-t {
+    display: none;
+  }
+}
+
+/* ---- banner ---- */
+
+.wz-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border-left: 4px solid var(--warn);
+  background: var(--warn-bg);
+  font-weight: 600;
+}
+
+.wz-banner[data-level="error"] {
+  border-color: var(--panic);
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.wz-banner-text {
+  flex: 1 1 260px;
+}
+
+/* ---- step ---- */
+
+.wz-step {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.wz-step-title {
+  font-size: 1.05rem;
+}
+
+.wz-step-title:focus {
+  outline: none;
+}
+
+.wz-step-title:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.wz-step-body {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  max-width: 900px;
+}
+
+.wz-lead {
+  font-size: 0.98rem;
+}
+
+.wz-sub {
+  margin: 6px 0 0;
+  font-size: 0.9rem;
+}
+
+.wz-list {
+  margin: 0;
+  padding-left: 1.3em;
+  display: grid;
+  gap: 4px;
+  font-size: 0.92rem;
+}
+
+.wz-list:empty,
+.wz-list[hidden] {
+  display: none;
+}
+
+.wz-errors {
+  color: var(--danger);
+}
+
+.wz-advice li {
+  padding-left: 2px;
+}
+
+.wz-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 10px;
+}
+
+.wz-big-btn {
+  min-height: 44px;
+  padding: 8px 18px;
+  font-size: 1rem;
+  white-space: normal;
+  text-align: left;
+}
+
+.wz-finish {
+  margin-top: 6px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+/* ---- notes ---- */
+
+.wz-note {
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  border-left: 4px solid var(--info);
+  background: var(--info-bg);
+  font-size: 0.9rem;
+}
+
+.wz-note--ok {
+  border-color: var(--ok);
+  background: var(--ok-bg);
+}
+
+.wz-note--warn {
+  border-color: var(--warn);
+  background: var(--warn-bg);
+}
+
+.wz-note--error {
+  border-color: var(--danger);
+  background: var(--danger-bg);
+}
+
+/* ---- checklists and choices ---- */
+
+.wz-checklist {
+  display: grid;
+  gap: 8px;
+}
+
+.wz-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 0.92rem;
+  cursor: pointer;
+}
+
+.wz-check input {
+  margin-top: 3px;
+  flex: none;
+  width: 18px;
+  height: 18px;
+}
+
+.wz-choices {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+
+.wz-legend {
+  grid-column: 1 / -1;
+  padding: 0;
+  margin-bottom: 6px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.wz-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  cursor: pointer;
+}
+
+.wz-choice:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.wz-choice:has(input:disabled) {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.wz-choice input {
+  margin-top: 3px;
+  flex: none;
+}
+
+.wz-choice-body {
+  display: grid;
+  gap: 2px;
+}
+
+.wz-choice-text {
+  font-size: 0.84rem;
+  color: var(--text-muted);
+}
+
+/* ---- forms ---- */
+
+.wz-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 10px 14px;
+}
+
+.wz-num-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.wz-num {
+  width: 100%;
+  min-height: 34px;
+  padding: 5px 8px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.wz-unit {
+  color: var(--text-muted);
+  font-size: 0.88rem;
+  min-width: 1.5em;
+}
+
+/* ---- progress ---- */
+
+.wz-progress-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+}
+
+.wz-progress {
+  flex: 1 1 220px;
+  height: 10px;
+  accent-color: var(--accent);
+}
+
+.wz-progress-text {
+  font-size: 0.88rem;
+  color: var(--text-muted);
+}
+
+/* ---- measurements ---- */
+
+.wz-paths {
+  display: grid;
+  gap: 8px;
+}
+
+.wz-path-row {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+
+.wz-path-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+}
+
+.wz-path-head strong {
+  flex: 1 1 220px;
+}
+
+.wz-badge {
+  display: inline-flex;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  border: 1px solid var(--border-strong);
+  color: var(--text-muted);
+}
+
+.wz-badge--ok {
+  color: var(--ok);
+  border-color: var(--ok);
+  background: var(--ok-bg);
+}
+
+.wz-badge--running {
+  color: var(--info);
+  border-color: var(--info);
+  background: var(--info-bg);
+}
+
+.wz-badge--failed {
+  color: var(--danger);
+  border-color: var(--danger);
+  background: var(--danger-bg);
+}
+
+.wz-prompt {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 2px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  font-weight: 600;
+}
+
+.wz-zones {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 10px;
+}
+
+.wz-zone,
+.wz-block {
+  display: grid;
+  gap: 8px;
+}
+
+.wz-zone {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+
+.wz-zone h5 {
+  margin: 0;
+  font-size: 0.92rem;
+}
+
+/* ---- figures (guide diagrams) ---- */
+
+.wz-figures {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 12px;
+}
+
+.wz-figures figure {
+  margin: 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--canvas-bg);
+}
+
+.wz-figures figcaption {
+  font-size: 0.82rem;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+
+/* ---- verification ---- */
+
+.wz-readout-box {
+  display: grid;
+  gap: 2px;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+
+.wz-readout {
+  font-size: 2rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.wz-readout[data-state="good"] {
+  color: var(--ok);
+}
+
+.wz-readout[data-state="worse"] {
+  color: var(--danger);
+}
+
+/* Per-band attenuation of step 7: compact columns of "fc Hz: A dB". */
+.wz-bands {
+  list-style: none;
+  padding: 0;
+  grid-template-columns: repeat(auto-fill, minmax(9.5em, 1fr));
+  gap: 2px 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- navigation ---- */
+
+.wz-nav {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.wz-nav-mid {
+  flex: 1 1 200px;
+  display: grid;
+  gap: 2px;
+}
+
+.wz-nav-reason,
+.wz-busy {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.wz-busy:empty,
+.wz-nav-reason:empty {
+  display: none;
+}
+
+.wz-devices .device-panel {
+  margin: 0;
+}

@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- Anti-phase glyph: a wave (white) and its inverted copy (light blue) on the app's accent colour. -->
+  <rect width="32" height="32" rx="7" fill="#0a62c9"/>
+  <path d="M4 16C8 26 12 26 16 16S24 6 28 16" fill="none" stroke="#8fc1ff" stroke-width="2.4" stroke-linecap="round"/>
+  <path d="M4 16C8 6 12 6 16 16S24 26 28 16" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round"/>
+</svg>

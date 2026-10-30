@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta
+      name="description"
+      content="Amplificatore in controfase in tempo reale: cancellazione attiva del rumore feed-forward nel browser."
+    />
+    <title>Amplificatore in controfase</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <!-- Saved light/dark theme before the first paint (external: the CSP forbids inline scripts). -->
+    <script src="/theme-init.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Vai ai controlli</a>
+    <header class="app-header">
+      <h1>Amplificatore in controfase</h1>
+      <p>Cancellazione attiva del rumore feed-forward · microfono di riferimento → DSP → uscite L/R</p>
+    </header>
+
+    <div id="status-bar" class="status-bar-host" role="region" aria-label="Barra di stato e comandi"></div>
+
+    <main id="main" tabindex="-1">
+      <section id="warnings" class="panel panel--warnings" aria-label="Avvisi"></section>
+
+      <section class="panel panel--gate" aria-labelledby="h-gate">
+        <h2 id="h-gate">Uscita</h2>
+        <div id="output-gate"></div>
+      </section>
+
+      <!-- Mount point of the guided setup (src/ui/wizard/), hidden while empty. -->
+      <section id="wizard" class="panel" aria-label="Configurazione guidata"></section>
+
+      <div class="console">
+        <section class="panel area-devices" aria-labelledby="h-devices">
+          <h2 id="h-devices">Dispositivi</h2>
+          <div id="devices"></div>
+        </section>
+
+        <section class="panel area-channels" aria-labelledby="h-channels">
+          <h2 id="h-channels">Uscite</h2>
+          <div class="strips">
+            <div id="strip-l"></div>
+            <div id="strip-r"></div>
+          </div>
+        </section>
+
+        <section class="panel area-meters" aria-labelledby="h-meters">
+          <h2 id="h-meters">Livelli e attenuazione</h2>
+          <div id="meters"></div>
+        </section>
+
+        <section class="panel area-filters" aria-labelledby="h-filters">
+          <h2 id="h-filters">Fase e filtri</h2>
+          <div id="filters"></div>
+        </section>
+
+        <section class="panel area-scope" aria-labelledby="h-scope">
+          <h2 id="h-scope">Oscilloscopio</h2>
+          <div id="scope"></div>
+        </section>
+
+        <section class="panel area-spectrum" aria-labelledby="h-spectrum">
+          <h2 id="h-spectrum">Spettro</h2>
+          <div id="spectrum"></div>
+        </section>
+
+        <section class="panel area-presets" aria-labelledby="h-presets">
+          <h2 id="h-presets">Preset</h2>
+          <div id="presets"></div>
+        </section>
+      </div>
+
+      <section id="guide" class="panel" aria-label="Guida"></section>
+    </main>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,21 @@
+# Rebuilt inside the image or not needed to build it.
+node_modules
+**/node_modules
+dist
+dist-e2e
+test-results
+playwright-report
+coverage
+*.tsbuildinfo
+e2e/fixtures/*.wav
+
+# Never send private material or local state to the build context.
+certs
+.env
+.env.*
+.git
+.claude
+.vscode
+.idea
+**/.DS_Store
+npm-debug.log*

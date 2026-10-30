@@ -3,12 +3,15 @@ import { TAP_BLOCK_FRAMES, TAP_CHANNELS } from '../../src/audio/protocol.ts';
 import type { WorkletInMsg, WorkletOutMsg } from '../../src/audio/protocol.ts';
 import { AntiPhaseEngine, LIMITER_BACKSTOP_MS } from '../../src/dsp/antiphase-engine.ts';
 import type { EngineOptions } from '../../src/dsp/antiphase-engine.ts';
-import { cArg, cDelay, cMul } from '../../src/dsp/complex.ts';
+import { Biquad, highpass } from '../../src/dsp/biquad.ts';
+import { cAbs, cArg, cDelay, cMul } from '../../src/dsp/complex.ts';
 import { DelayLine } from '../../src/dsp/fractional-delay.ts';
 import type { Complex } from '../../src/dsp/complex.ts';
-import { BIG_JUMP_DB, MASTER_MIN_DB, MAX_RISE_DB_PER_S, clampParams, computeChannelDelay } from '../../src/dsp/params.ts';
-import type { EngineParams, PhaseMode } from '../../src/dsp/params.ts';
+import { trimForTarget } from '../../src/dsp/harmonic-trims.ts';
+import { BIG_JUMP_DB, MASTER_MIN_DB, MAX_RISE_DB_PER_S, clampParams, computeChannelDelay, neutralTrims } from '../../src/dsp/params.ts';
+import type { EngineParams, HarmonicTrim, PhaseMode } from '../../src/dsp/params.ts';
 import { hilbertResponse } from '../../src/dsp/hilbert-pair.ts';
+import { HowlDetector } from '../../src/dsp/howl-detector.ts';
 import { channelResponse, conditioningResponse } from '../../src/dsp/response.ts';
 import { exponentialSweep, mulberry32 } from '../../src/dsp/sweep.ts';
 
@@ -1458,13 +1461,17 @@ describe('AntiPhaseEngine: taps', () => {
 });
 
 describe('AntiPhaseEngine: robustness', () => {
-  it('NaN/Infinity inputs, parameters and stimuli never yield NaN outputs', () => {
+  it('NaN/Infinity inputs, parameters (harmonic trims too) and stimuli never yield NaN outputs', () => {
     const r = new Rig();
     r.params((p) => {
       p.masterDb = Number.NaN;
       p.channels[0].delayMs = Number.POSITIVE_INFINITY;
       p.channels[0].gainDb = 0;
       p.fRef = Number.NaN;
+      p.phaseMode = 'tonal';
+      p.channels[0].harmonicTrims[0] = { gainDb: Number.NaN, phaseDeg: Number.POSITIVE_INFINITY };
+      p.channels[0].harmonicTrims[1] = { gainDb: Number.POSITIVE_INFINITY, phaseDeg: Number.NaN };
+      p.channels[1].harmonicTrims = [null, { gainDb: 1e300, phaseDeg: -1e300 }] as unknown as HarmonicTrim[];
     });
     r.send({ type: 'arm', armed: true });
     const n = 3 * fs;
@@ -1570,6 +1577,13 @@ describe('AntiPhaseEngine: fuzzed control sequences', () => {
                 c.gainDb = -60 + 72 * rnd();
                 c.delayMs = rnd() < 0.3 ? 0 : 500 * rnd() * rnd();
                 c.phaseDeltaDeg = -180 + 360 * rnd();
+                c.harmonicTrims =
+                  rnd() < 0.3
+                    ? neutralTrims()
+                    : Array.from({ length: 8 }, () => ({
+                        gainDb: rnd() < 0.05 ? Number.NaN : -40 + 50 * rnd(),
+                        phaseDeg: -200 + 400 * rnd(),
+                      }));
               }
             });
             break;
@@ -1653,5 +1667,591 @@ describe('AntiPhaseEngine: fuzzed control sequences', () => {
     const back = r.run(2 * fs, x);
     const a = r.pos - 2 * fs;
     for (let i = ms(1500) + 2; i < 2 * fs; i++) expect(Math.abs(back.L[i] + x[a + i - 1])).toBeLessThan(1e-9);
+  });
+});
+
+describe('AntiPhaseEngine: harmonic trims (tonal mode)', () => {
+  const randomTrims = (rnd: () => number): HarmonicTrim[] =>
+    Array.from({ length: 8 }, () => ({ gainDb: -12 + 18 * rnd(), phaseDeg: -180 + 360 * rnd() }));
+  const only = (h: number, gainDb: number, phaseDeg: number): HarmonicTrim[] => {
+    const t = neutralTrims();
+    t[h - 1] = { gainDb, phaseDeg };
+    return t;
+  };
+
+  /** Engine at `rate` with the params `mod` sets, armed, run over x (128-sample blocks). */
+  function runAt(rate: number, mod: (p: EngineParams) => void, x: Float32Array): { L: Float32Array; R: Float32Array; p: EngineParams } {
+    const e = new AntiPhaseEngine(rate, { softStartMs: 50 });
+    const p = e.params;
+    mod(p);
+    e.handleMessage({ type: 'params', params: p });
+    e.handleMessage({ type: 'arm', armed: true });
+    const L = new Float32Array(x.length);
+    const R = new Float32Array(x.length);
+    for (let off = 0; off < x.length; off += 128) {
+      const m = Math.min(128, x.length - off);
+      e.process(x.subarray(off, off + m), null, L.subarray(off, off + m), R.subarray(off, off + m));
+      e.drain(() => {});
+    }
+    return { L, R, p: e.params };
+  }
+
+  function dftAt(x: Float32Array, f: number, from: number, len: number, rate: number): Complex {
+    let re = 0;
+    let im = 0;
+    for (let i = from; i < from + len; i++) {
+      const w = (2 * Math.PI * f * i) / rate;
+      re += x[i] * Math.cos(w);
+      im -= x[i] * Math.sin(w);
+    }
+    return { re, im };
+  }
+
+  /** Sum of the first `h` harmonics of f0, 0.04 each, random phases. */
+  function harmonicsSignal(n: number, f0: number, h: number, rate: number, rnd: () => number): Float32Array {
+    const ph = Array.from({ length: h }, () => 2 * Math.PI * rnd());
+    const x = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      let v = 0;
+      for (let k = 1; k <= h; k++) v += 0.04 * Math.sin((2 * Math.PI * k * f0 * i) / rate + ph[k - 1]);
+      x[i] = v;
+    }
+    return x;
+  }
+
+  const tonal = (f0: number, harmonics: number) => (p: EngineParams): void => {
+    p.phaseMode = 'tonal';
+    p.tonal = { f0, harmonics, q: 30 };
+    p.filters.lpFreq = 2000;
+    p.masterDb = -6;
+    p.ceilingDb = -1;
+    p.channels[0].gainDb = 0;
+    p.channels[0].delayMs = 1.3;
+    p.channels[0].phaseDeltaDeg = 25;
+    p.channels[1].gainDb = -3;
+    p.channels[1].delayMs = 4.1;
+    p.channels[1].phaseDeltaDeg = -70;
+    p.channels[1].polarityInvert = false;
+  };
+
+  /** Peak of y above 2 kHz (zero-phase 8th-order high-pass) in [from, to), dB re `ref`. */
+  function clickDb(y: Float32Array, from: number, to: number, ref: number): number {
+    const e = Float64Array.from(y);
+    for (const q of [0.5411961001461969, 1.3065629648763766]) {
+      const c = highpass(fs, 2000, q);
+      let s = new Biquad(c);
+      for (let i = 0; i < e.length; i++) e[i] = s.process(e[i]);
+      s = new Biquad(c);
+      for (let i = e.length - 1; i >= 0; i--) e[i] = s.process(e[i]);
+    }
+    let pk = 0;
+    for (let i = from; i < to; i++) pk = Math.max(pk, Math.abs(e[i]));
+    return 20 * Math.log10(pk / ref);
+  }
+
+  for (const [rate, f0] of [[44100, 90], [48000, 120], [96000, 75]] as const) {
+    it(`${rate} Hz, harmonics 1…8, random trims (L ≠ R): output = channelResponse at every harmonic (±0.5°, ±0.05 dB)`, () => {
+      const rnd = mulberry32(rate);
+      for (let h = 1; h <= 8; h++) {
+        const n = Math.round(2.5 * rate);
+        const x = harmonicsSignal(n, f0, h, rate, rnd);
+        const tL = randomTrims(rnd);
+        const tR = randomTrims(rnd);
+        const { L, R, p } = runAt(rate, (q) => {
+          tonal(f0, h)(q);
+          q.channels[0].harmonicTrims = tL;
+          q.channels[1].harmonicTrims = tR;
+        }, x);
+        const from = n - rate;
+        for (let k = 1; k <= h; k++) {
+          const xin = dftAt(x, k * f0, from, rate, rate);
+          for (const [ch, y] of [[0, L], [1, R]] as const) {
+            const got = ratio(dftAt(y, k * f0, from, rate, rate), xin);
+            const want = channelResponse(p, rate, k * f0, ch);
+            expect(Math.abs(wrapDeg(deg(cArg(got) - cArg(want)))), `h=${h} k=${k} ch=${ch}`).toBeLessThan(0.5);
+            expect(Math.abs(db(got) - db(want)), `h=${h} k=${k} ch=${ch}`).toBeLessThan(0.05);
+          }
+        }
+      }
+    });
+  }
+
+  it('total phase at h·f0 = polarity + h·Δ + θ_h: a +30° trim at h = 3 lags 3·f0 by 30° more, nothing else moves', () => {
+    const f0 = 100;
+    const x = harmonicsSignal(3 * fs, f0, 4, fs, mulberry32(77));
+    const base = runAt(fs, tonal(f0, 4), x);
+    const lag = runAt(fs, (q) => {
+      tonal(f0, 4)(q);
+      q.channels[0].harmonicTrims = only(3, 0, 30);
+      q.channels[1].harmonicTrims = only(2, -6, 0);
+    }, x);
+    const from = 2 * fs;
+    for (let k = 1; k <= 4; k++) {
+      for (const ch of ['L', 'R'] as const) {
+        const a = dftAt(base[ch], k * f0, from, fs, fs);
+        const b = dftAt(lag[ch], k * f0, from, fs, fs);
+        const extraLag = -wrapDeg(deg(cArg(b) - cArg(a)));
+        const dDb = db(b) - db(a);
+        const wantLag = ch === 'L' && k === 3 ? 30 : 0;
+        const wantDb = ch === 'R' && k === 2 ? -6 : 0;
+        expect(Math.abs(extraLag - wantLag), `${ch} h${k}`).toBeLessThan(0.1);
+        expect(Math.abs(dDb - wantDb), `${ch} h${k}`).toBeLessThan(0.02);
+      }
+    }
+  });
+
+  it('trims act only in tonal mode, on the harmonics in use; the cond tap stays the neutral bank', () => {
+    const x = harmonicsSignal(fs, 100, 8, fs, mulberry32(5));
+    const trims = randomTrims(mulberry32(6));
+    for (const [name, mod] of [
+      ['delay mode', (p: EngineParams) => (p.phaseMode = 'delay')],
+      ['hilbert mode', (p: EngineParams) => (p.phaseMode = 'hilbert')],
+    ] as const) {
+      const a = runAt(fs, (p) => { tonal(100, 4)(p); mod(p); }, x);
+      const b = runAt(fs, (p) => {
+        tonal(100, 4)(p);
+        mod(p);
+        p.channels[0].harmonicTrims = trims;
+        p.channels[1].harmonicTrims = trims;
+      }, x);
+      expect(b.L.every((v, i) => v === a.L[i]), name).toBe(true);
+      expect(b.R.every((v, i) => v === a.R[i]), name).toBe(true);
+    }
+    // harmonics 3: trims of h4…h8 are ignored
+    const above = neutralTrims().map((t, i) => (i >= 3 ? { gainDb: 6, phaseDeg: 120 } : t));
+    const a = runAt(fs, tonal(100, 3), x);
+    const b = runAt(fs, (p) => { tonal(100, 3)(p); p.channels[0].harmonicTrims = above; }, x);
+    expect(b.L.every((v, i) => v === a.L[i])).toBe(true);
+    // cond tap: identical with and without trims
+    const conds: Float32Array[] = [];
+    for (const t of [neutralTrims(), trims]) {
+      const r = new Rig({ softStartMs: 50 });
+      r.tapCopies = [];
+      r.params((p) => {
+        tonal(100, 4)(p);
+        p.channels[0].harmonicTrims = t;
+      });
+      r.send({ type: 'arm', armed: true });
+      r.send({ type: 'tap', enabled: true });
+      r.run(4 * TAP_BLOCK_FRAMES, x);
+      expect(r.tapCopies.length).toBe(4);
+      const F = TAP_BLOCK_FRAMES;
+      conds.push(Float32Array.from(r.tapCopies.flatMap((blk) => Array.from(blk.subarray(F, 2 * F)))));
+    }
+    expect(conds[1].every((v, i) => v === conds[0][i])).toBe(true);
+  });
+
+  it('block sizes 1, 64, 128, 256, 4096 give identical outputs with trims, a trim change and a rise under way', () => {
+    const n = fs;
+    const x = harmonicsSignal(n, 137, 4, fs, mulberry32(9));
+    const nz = noise(n, 0.02, 10);
+    for (let i = 0; i < n; i++) x[i] += nz[i];
+    const runWith = (block: number) => {
+      const r = new Rig({ softStartMs: 300 });
+      r.params((p) => {
+        tonal(137, 4)(p);
+        p.channels[0].harmonicTrims = only(2, -30, 40);
+        p.channels[1].harmonicTrims = only(1, 3, -60);
+      });
+      r.send({ type: 'arm', armed: true });
+      const a = r.run(ms(400), x, null, block);
+      r.params((p) => {
+        p.channels[0].harmonicTrims = only(2, 6, -20); // a rise of 36 dB: 6 dB/s
+        p.channels[1].harmonicTrims = only(3, -4, 90);
+        p.tonal.f0 = 138;
+      });
+      const b = r.run(n - ms(400), x, null, block);
+      return { L: [...a.L, ...b.L], R: [...a.R, ...b.R] };
+    };
+    const ref = runWith(128);
+    for (const block of [1, 64, 256, 4096]) {
+      const o = runWith(block);
+      let worst = 0;
+      for (let i = 0; i < n; i++) worst = Math.max(worst, Math.abs(o.L[i] - ref.L[i]), Math.abs(o.R[i] - ref.R[i]));
+      expect(worst, `block ${block}`).toBeLessThan(1e-12);
+    }
+  });
+
+  it('a trim gain rise of more than BIG_JUMP_DB goes at ≤ 6 dB/s (−30 → +6 dB: ≥ 5 s); the decrease is immediate', () => {
+    const f0 = 100;
+    const r = new Rig({ softStartMs: 50 });
+    r.params((p) => {
+      tonal(f0, 4)(p);
+      p.channels[0].harmonicTrims = only(2, -30, 0);
+    });
+    r.send({ type: 'arm', armed: true });
+    const x = sine(12 * fs, 2 * f0, 0.2);
+    r.run(fs, x);
+    const win = ms(20); // 4 periods of 200 Hz
+    const level = (y: Float32Array, at: number) => db(dftAt(y, 2 * f0, at, win, fs));
+    const start = level(r.run(win, x).L, 0);
+    r.params((p) => (p.channels[0].harmonicTrims = only(2, 6, 0)));
+    const rise = r.run(7 * fs, x).L;
+    let reached = Infinity;
+    for (let at = 0; at + win <= rise.length; at += win) {
+      const rel = level(rise, at) - start;
+      const t = (at + win) / fs;
+      expect(rel, `${t.toFixed(2)} s`).toBeLessThanOrEqual(BIG_JUMP_DB + MAX_RISE_DB_PER_S * t + 0.05);
+      if (rel > 35.9 && reached === Infinity) reached = at / fs;
+    }
+    expect(reached).toBeGreaterThanOrEqual(4.95);
+    expect(reached).toBeLessThan(5.3);
+    expect(Math.abs(level(rise, rise.length - win) - start - 36)).toBeLessThan(0.05);
+    r.params((p) => (p.channels[0].harmonicTrims = only(2, -30, 0)));
+    const fall = r.run(ms(100), x).L;
+    expect(Math.abs(level(fall, ms(40)) - start)).toBeLessThan(0.05);
+  });
+
+  it('a trim raised while bypassed waits, then rises at 6 dB/s once the anti-noise is heard again', () => {
+    const r = new Rig({ softStartMs: 50 });
+    r.params((p) => {
+      tonal(100, 4)(p);
+      p.channels[0].harmonicTrims = only(1, -30, 0);
+    });
+    r.send({ type: 'arm', armed: true });
+    const x = sine(8 * fs, 100, 0.2);
+    r.run(fs, x);
+    const level = (y: Float32Array, at: number) => db(dftAt(y, 100, at, ms(20), fs));
+    const start = level(r.run(ms(20), x).L, 0);
+    r.send({ type: 'bypass', bypass: true });
+    r.run(ms(50), x);
+    r.params((p) => (p.channels[0].harmonicTrims = only(1, 6, 0)));
+    r.run(3 * fs, x);
+    r.send({ type: 'bypass', bypass: false });
+    const y = r.run(fs, x).L;
+    // after the 15 ms bypass ramp: ≤ 6 dB + 6 dB/s, not the +36 dB the target asks for
+    expect(level(y, ms(30)) - start).toBeLessThan(BIG_JUMP_DB + MAX_RISE_DB_PER_S * 0.05 + 0.1);
+    expect(level(y, fs - ms(20)) - start).toBeLessThan(BIG_JUMP_DB + MAX_RISE_DB_PER_S * 1 + 0.1);
+    expect(level(y, fs - ms(20)) - start).toBeGreaterThan(MAX_RISE_DB_PER_S * 0.9);
+  });
+
+  it('trim changes and the 6 dB/s staircase are click-free (nothing above 2 kHz, ≤ −100 dB)', () => {
+    for (const f of [50, 100, 400]) {
+      const r = new Rig({ softStartMs: 50 });
+      r.params((p) => {
+        tonal(f, 4)(p);
+        p.masterDb = 0;
+      });
+      r.send({ type: 'arm', armed: true });
+      const amp = 0.2;
+      const x = sine(9 * fs, f, amp);
+      r.run(2 * fs, x);
+      const pre = r.run(ms(100), x).L;
+      r.params((p) => (p.channels[0].harmonicTrims = only(1, 6, 90)));
+      const post = r.run(ms(400), x).L;
+      const y = Float32Array.from([...pre, ...post]);
+      expect(clickDb(y, ms(100) - 240, ms(100) + 4800, amp), `0 → +6 dB / 90° at ${f} Hz`).toBeLessThan(-100);
+      r.params((p) => (p.channels[0].harmonicTrims = only(1, -30, -170)));
+      r.run(ms(100), x);
+      r.params((p) => (p.channels[0].harmonicTrims = only(1, 6, -170)));
+      const rise = r.run(6 * fs, x).L;
+      expect(clickDb(rise, ms(50), rise.length - ms(50), amp), `6 dB/s rise at ${f} Hz`).toBeLessThan(-100);
+    }
+  });
+
+  it('an f0 glide (live) and a harmonics change (structural) keep the trims: settled output = channelResponse', () => {
+    const t = randomTrims(mulberry32(44));
+    const f1 = 102;
+    const r = new Rig({ softStartMs: 50 });
+    r.params((p) => {
+      tonal(100, 4)(p);
+      p.channels[0].harmonicTrims = t;
+      p.channels[1].harmonicTrims = only(4, 4, -45);
+    });
+    r.send({ type: 'arm', armed: true });
+    const x = harmonicsSignal(10 * fs, f1, 6, fs, mulberry32(45));
+    r.run(fs, x);
+    const before = r.run(ms(200), x).L;
+    const limit = maxAbsDiff(before, 0, before.length);
+    r.params((p) => (p.tonal.f0 = f1));
+    let a = r.pos;
+    let y = r.run(3 * fs, x);
+    expect(maxAbsDiff(y.L, 0, ms(200))).toBeLessThan(2 * limit);
+    const check = (k: number, from: number) => {
+      for (const [ch, out] of [[0, y.L], [1, y.R]] as const) {
+        const got = ratio(dftAt(out, k * f1, from, fs, fs), dftAt(x.subarray(a), k * f1, from, fs, fs));
+        const want = channelResponse(r.e.params, fs, k * f1, ch);
+        expect(Math.abs(wrapDeg(deg(cArg(got) - cArg(want)))), `h${k} ch${ch}`).toBeLessThan(0.5);
+        expect(Math.abs(db(got) - db(want)), `h${k} ch${ch}`).toBeLessThan(0.05);
+      }
+    };
+    for (let k = 1; k <= 4; k++) check(k, 2 * fs);
+    // 4 → 6 harmonics: a structural swap; the new chain takes the trims of h5 and h6 too
+    r.params((p) => {
+      p.tonal.harmonics = 6;
+      p.channels[0].harmonicTrims[4] = { gainDb: 3, phaseDeg: 100 };
+    });
+    a = r.pos;
+    y = r.run(3 * fs, x);
+    for (let k = 1; k <= 6; k++) check(k, 2 * fs);
+  });
+
+  it('measurements are unaffected: the same stimulus output and recording with or without trims', () => {
+    const results = [neutralTrims(), Array.from({ length: 8 }, () => ({ gainDb: 6, phaseDeg: 90 }))].map((t) => {
+      const r = new Rig({ softStartMs: 50 });
+      r.params((p) => {
+        tonal(100, 8)(p);
+        p.channels[0].harmonicTrims = t;
+        p.channels[1].harmonicTrims = t;
+      });
+      r.send({ type: 'arm', armed: true });
+      const x = harmonicsSignal(3 * fs, 100, 8, fs, mulberry32(3));
+      r.run(fs, x);
+      const stim = exponentialSweep({ fs, f1: 50, f2: 2000, durationS: 0.5, fadeMs: 20, amplitude: 0.3 });
+      r.send({ type: 'measure', id: 1, stimulus: stim, channel: 0, postRollFrames: 1000 });
+      const { L, R } = r.run(fs, x);
+      const res = r.of('measureResult')[0];
+      expect(res.aborted).toBe(false);
+      // while the stimulus plays (after the 15 ms gate) the anti-noise is at 0
+      return { L: L.subarray(ms(15), ms(15) + stim.length), R: R.subarray(ms(15), ms(15) + stim.length), ref: res.ref };
+    });
+    const [a, b] = results;
+    expect(b.L.every((v, i) => v === a.L[i])).toBe(true);
+    expect(b.R.every((v, i) => v === 0 && a.R[i] === 0)).toBe(true);
+    expect(b.ref.every((v, i) => v === a.ref[i])).toBe(true);
+  });
+
+  it('+6 dB trims on every harmonic of a loud tone: never above the ceiling', () => {
+    const r = new Rig({ softStartMs: 50 });
+    r.params((p) => {
+      tonal(100, 8)(p);
+      p.masterDb = 0;
+      p.ceilingDb = -12;
+      p.gainUnlocked = true;
+      p.channels[0].gainDb = 6;
+      for (const c of p.channels) c.harmonicTrims = Array.from({ length: 8 }, (_, k) => ({ gainDb: 6, phaseDeg: 45 * k }));
+    });
+    r.send({ type: 'arm', armed: true });
+    const x = harmonicsSignal(4 * fs, 100, 8, fs, mulberry32(12));
+    for (let i = 0; i < x.length; i++) x[i] *= 10;
+    const { L, R } = r.run(4 * fs, x);
+    const ceil = Math.pow(10, -12 / 20);
+    let peak = 0;
+    for (let i = 0; i < L.length; i++) peak = Math.max(peak, Math.abs(L[i]), Math.abs(R[i]));
+    expect(peak).toBeLessThanOrEqual(ceil);
+    expect(peak).toBeGreaterThan(0.99 * ceil);
+  });
+
+  describe('a harmonic rises with the channel gain (and master) and its trim: one budget for both', () => {
+    /** Level at f0 of channel L, 0.1 s windows (10 periods), relative to the 0.1 s before `change` at t = 1 s. */
+    function rise(start: (p: EngineParams) => void, change: (p: EngineParams) => void, at: number[]): number[] {
+      const r = new Rig({ softStartMs: 10 });
+      r.params((p) => {
+        tonal(100, 4)(p);
+        p.masterDb = 0;
+        p.ceilingDb = -1;
+        p.channels[0].gainDb = -20;
+        start(p);
+      });
+      r.send({ type: 'arm', armed: true });
+      const x = sine(5 * fs, 100, 0.01);
+      const before = r.run(fs, x).L;
+      const level = (y: Float32Array, from: number) => db(dft(y, 100, from, ms(100)));
+      const ref = level(before, fs - ms(100));
+      r.params(change);
+      const y = r.run(3 * fs, x).L;
+      return at.map((t) => level(y, ms(t * 1000)) - ref);
+    }
+    const allowed = (t: number): number => BIG_JUMP_DB + MAX_RISE_DB_PER_S * t;
+
+    it('gain +6 dB and trim +6 dB in one message: ≤ 6 dB + 6 dB/s (was +12 dB at once)', () => {
+      const [a, b] = rise(() => {}, (p) => {
+        p.channels[0].gainDb = -14;
+        p.channels[0].harmonicTrims = only(1, 6, 0);
+      }, [0.04, 1.5]);
+      // window [40, 140] ms ends 140 ms after the change
+      expect(a).toBeLessThanOrEqual(allowed(0.14) + 0.05);
+      expect(a).toBeGreaterThan(BIG_JUMP_DB - 0.2);
+      expect(b).toBeCloseTo(12, 1);
+    });
+
+    it('master +6 dB and trim +6 dB: the same', () => {
+      const [a] = rise((p) => (p.masterDb = -6), (p) => {
+        p.masterDb = 0;
+        p.channels[0].harmonicTrims = only(1, 6, 0);
+      }, [0.04]);
+      expect(a).toBeLessThanOrEqual(allowed(0.14) + 0.05);
+    });
+
+    it('gain −40 → −20 dB with trim −30 → +6 dB: the harmonic rises at 6 dB/s, not 12', () => {
+      const t = [0.4, 0.9, 1.4, 1.9];
+      const got = rise((p) => {
+        p.channels[0].gainDb = -40;
+        p.channels[0].harmonicTrims = only(1, -30, 0);
+      }, (p) => {
+        p.channels[0].gainDb = -20;
+        p.channels[0].harmonicTrims = only(1, 6, 0);
+      }, t);
+      got.forEach((g, i) => expect(g, `${t[i]} s`).toBeLessThanOrEqual(allowed(t[i] + 0.1) + 0.05));
+      expect(got[3]).toBeGreaterThan(allowed(1.9) - 1);
+    });
+
+    it('a trim rise holds the gain back on the same channel only, and other harmonics keep their own budget', () => {
+      // h1 takes +6 dB at once; the gain must then wait (it also raises h1), harmonic 2 may still jump.
+      const r = new Rig({ softStartMs: 10 });
+      r.params((p) => {
+        tonal(100, 4)(p);
+        p.masterDb = 0;
+        p.ceilingDb = -1;
+        p.channels[0].gainDb = -20;
+        p.channels[1].gainDb = -20;
+      });
+      r.send({ type: 'arm', armed: true });
+      const x = new Float32Array(3 * fs);
+      for (let i = 0; i < x.length; i++) x[i] = 0.01 * (Math.sin((2 * Math.PI * 100 * i) / fs) + Math.sin((2 * Math.PI * 200 * i) / fs));
+      const before = r.run(fs, x);
+      const lv = (y: Float32Array, f: number, from: number) => db(dft(y, f, from, ms(100)));
+      r.params((p) => (p.channels[0].harmonicTrims = only(1, 6, 0)));
+      r.params((p) => (p.channels[0].harmonicTrims[1] = { gainDb: 6, phaseDeg: 0 }));
+      r.params((p) => {
+        p.channels[0].gainDb = -14;
+        p.channels[1].gainDb = -14;
+      });
+      const y = r.run(fs, x);
+      // channel L: h1 and h2 +6 dB at once, the gain at 6 dB/s; channel R (no trims): the gain at once
+      expect(lv(y.L, 100, ms(40)) - lv(before.L, 100, fs - ms(100))).toBeLessThan(allowed(0.14) + 0.05);
+      expect(lv(y.L, 200, ms(40)) - lv(before.L, 200, fs - ms(100))).toBeLessThan(allowed(0.14) + 0.05);
+      expect(lv(y.L, 200, ms(40)) - lv(before.L, 200, fs - ms(100))).toBeGreaterThan(BIG_JUMP_DB - 0.2);
+      expect(lv(y.R, 100, ms(150)) - lv(before.R, 100, fs - ms(100))).toBeGreaterThan(BIG_JUMP_DB - 0.2);
+    });
+  });
+
+  it('a dragged trim control (a message every 10–16 ms) moves in whole glides: nothing above 2 kHz (≤ −100 dB)', () => {
+    // The live bank gets one new trim per COEFF_RAMP_MS at most; a newer value waits for the glide's end.
+    for (const field of ['phaseDeg', 'gainDb'] as const) {
+      for (const every of [10, 16]) {
+        const r = new Rig({ softStartMs: 50 });
+        r.params((p) => {
+          tonal(100, 4)(p);
+          p.masterDb = 0;
+          p.filters.lpEnabled = false;
+          p.channels[0].harmonicTrims = only(1, field === 'gainDb' ? -6 : 0, 0);
+        });
+        r.send({ type: 'arm', armed: true });
+        const amp = 0.2;
+        const x = sine(4 * fs, 100, amp);
+        const pre = r.run(2 * fs, x).L;
+        const parts: Float32Array[] = [pre.subarray(pre.length - ms(100))];
+        for (let k = 1; k <= 30; k++) {
+          r.params((p) => {
+            p.channels[0].harmonicTrims = field === 'gainDb' ? only(1, -6 + (12 * k) / 30, 0) : only(1, 0, (180 * k) / 30);
+          });
+          parts.push(r.run(ms(every), x).L);
+        }
+        parts.push(r.run(ms(200), x).L);
+        const y = new Float32Array(parts.reduce((a, q) => a + q.length, 0));
+        let o = 0;
+        for (const q of parts) {
+          y.set(q, o);
+          o += q.length;
+        }
+        expect(clickDb(y, ms(95), y.length - ms(50), amp), `${field} every ${every} ms`).toBeLessThan(-100);
+        // a fast trim rise at constant commanded gain is no howl (the detector restarts its level tracks)
+        expect(r.of('howl'), `${field} every ${every} ms`).toHaveLength(0);
+        // and it ends on the last value asked for
+        expect(r.e.params.channels[0].harmonicTrims[0][field]).toBeCloseTo(field === 'gainDb' ? 6 : 180, 9);
+      }
+    }
+  });
+
+  it('only a trim rise faster than the 6 dB/s staircase restarts the howl level tracks (holdLevels)', () => {
+    const hold = vi.spyOn(HowlDetector.prototype, 'holdLevels');
+    try {
+      const r = new Rig({ softStartMs: 10 });
+      r.params((p) => {
+        tonal(100, 4)(p);
+        p.channels[0].harmonicTrims = only(1, -30, 0);
+      });
+      r.send({ type: 'arm', armed: true });
+      const x = sine(8 * fs, 100, 0.1);
+      r.run(fs, x);
+      hold.mockClear();
+      // −30 → 0 dB: 24 dB at 6 dB/s (no hold), then the last 6 dB from the budget (at most two fast hand-overs)
+      r.params((p) => (p.channels[0].harmonicTrims = only(1, 0, 0)));
+      r.run(ms(3900), x);
+      expect(hold).not.toHaveBeenCalled();
+      r.run(ms(1100), x);
+      expect(hold.mock.calls.length).toBeLessThanOrEqual(2);
+      // a drag: +0.5 dB every 20 ms from the budget, each hand-over held on channel L's detector only
+      hold.mockClear();
+      for (let k = 1; k <= 8; k++) {
+        r.params((p) => (p.channels[0].harmonicTrims = only(1, 0.5 * k, 0)));
+        r.run(ms(20), x);
+      }
+      expect(hold.mock.calls.length).toBeGreaterThanOrEqual(7);
+      expect(r.of('howl')).toHaveLength(0);
+    } finally {
+      hold.mockRestore();
+    }
+  });
+
+  it('howl detection sees a loop that the trims close (loop gain 1.5 in phase at f0) and mutes', () => {
+    const delay = 300;
+    const f0 = 100;
+    const r = new Rig();
+    // the loop phase at f0 is set to 0 by the trim of h1: x = amb + fb·outL[n − delay]
+    const p0 = r.e.params;
+    tonal(f0, 4)(p0);
+    p0.masterDb = 0;
+    p0.ceilingDb = -12;
+    p0.channels[1].enabled = false;
+    const open = cMul(channelResponse(p0, fs, f0, 0), cDelay(f0, fs, delay));
+    const fb = 1.5 / cAbs(open);
+    p0.channels[0].harmonicTrims = only(1, 0, 0);
+    p0.channels[0].harmonicTrims[0] = trimForTarget({ re: cAbs(open), im: 0 }, open);
+    r.send({ type: 'params', params: p0 });
+    const loop = cMul(channelResponse(r.e.params, fs, f0, 0), cDelay(f0, fs, delay));
+    expect(Math.abs(cArg(loop))).toBeLessThan(1e-6);
+    r.send({ type: 'arm', armed: true });
+    const n = Math.round(4 * fs);
+    const onset = 2 * fs;
+    const amb = noise(n, 0.01, 12);
+    const outL = new Float32Array(n);
+    const outR = new Float32Array(n);
+    const inp = new Float32Array(n);
+    r.runLoop(n, (i, oL) => amb[i] + (i >= onset ? fb * oL[i - delay] : 0), outL, outR, inp);
+    const howl = r.of('howl');
+    expect(howl.length).toBe(1);
+    expect(howl[0].at - onset).toBeLessThan(ms(1500));
+    expect(r.of('autoMute').length).toBe(1);
+    let peak = 0;
+    for (let i = 0; i < n; i++) peak = Math.max(peak, Math.abs(outL[i]));
+    expect(peak).toBeLessThanOrEqual(Math.pow(10, -12 / 20));
+  });
+});
+
+describe('AntiPhaseEngine: MeterSnapshot.masterDb (the master applied now)', () => {
+  it('follows the rate-limited master ramp, jumps with a stimulus, MASTER_MIN_DB when silent', () => {
+    const r = new Rig({ softStartMs: 10, meterHz: 100 });
+    r.params((p) => {
+      unity(p);
+      p.masterDb = -30;
+    });
+    // disarmed: applied at once
+    const silence = new Float32Array(12 * fs);
+    r.run(ms(50), silence);
+    expect(r.lastMeters().masterDb).toBe(-30);
+    r.send({ type: 'arm', armed: true });
+    r.run(ms(50), silence);
+    r.params((p) => (p.masterDb = 0));
+    r.run(fs, silence);
+    // 30 dB gap > 6 dB: 6 dB/s (meters every 10 ms: within one meter period)
+    expect(r.lastMeters().masterDb).toBeGreaterThan(-24 - 0.07);
+    expect(r.lastMeters().masterDb).toBeLessThan(-24 + 0.07);
+    r.run(4 * fs, silence);
+    expect(r.lastMeters().masterDb).toBeCloseTo(0, 6);
+    r.params((p) => (p.masterDb = -30));
+    r.run(ms(500), silence);
+    expect(r.lastMeters().masterDb).toBeCloseTo(-30, 6);
+    // a stimulus fixes the master at its target when it starts
+    r.params((p) => (p.masterDb = -6));
+    r.send({ type: 'measure', id: 1, stimulus: constant(ms(200), 0.01), channel: 0, postRollFrames: 0 });
+    r.run(ms(30), silence);
+    expect(r.lastMeters().measuring).toBe(true);
+    expect(r.lastMeters().masterDb).toBe(-6);
+    r.run(ms(300), silence);
+    r.params((p) => (p.masterDb = -500));
+    r.run(fs, silence);
+    expect(r.lastMeters().masterDb).toBe(MASTER_MIN_DB);
   });
 });

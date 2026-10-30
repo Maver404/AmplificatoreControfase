@@ -3,13 +3,16 @@
  * amplifier-level noise, band levels from the tap stream and the autotune driver.
  */
 import type { AppController, ControllerState } from '../../app/controller.ts';
-import { amplifierLevelNoise, bandRmsDbfs } from '../../audio/calibration.ts';
-import type { AutotuneDriver } from '../../audio/autotune.ts';
+import { harmonicLevelsDb, harmonicTolerancesHz } from '../../audio/autotune.ts';
+import type { AutotuneDriver, AutotuneResult } from '../../audio/autotune.ts';
+import { amplifierLevelNoise, bandRmsDbfs, capLoopGain } from '../../audio/calibration.ts';
+import type { CalibrationData } from '../../audio/calibration.ts';
 import { TAP_CHANNELS } from '../../audio/protocol.ts';
 import type { TapChannel } from '../../audio/protocol.ts';
 import type { EngineParams } from '../../dsp/params.ts';
+import { formatNumber } from '../units.ts';
 import { sleep } from './dom.ts';
-import { appendTapChannel, fadeEdges, harmonicLevelDbfs } from './logic.ts';
+import { appendTapChannel, calibratedMeasurements, fadeEdges, harmonicLevelDbfs } from './logic.ts';
 
 /** Length of one noise chunk (each is one measure() call; ≤ the engine's MAX_MEASURE_S). */
 export const NOISE_CHUNK_S = 10;
@@ -126,35 +129,99 @@ export function errorLevelDbfs(x: Float32Array, fs: number, band: [number, numbe
 }
 
 /**
- * Autotune driver on the controller: parameters through applyParams, error level from the
- * 'err' tap in the band (errorLevelDbfs), bypass windows with the A/B bypass (15 ms ramp) plus
- * a settling pause.
+ * `p`'s channels (all an autotune changes: delay, Δ, gain, trims) over the controller's parameters as they
+ * are now. The rest of `p` is what the run copied at its start: applied whole, every probe set tonal.f0 back
+ * to that value and the live follower moved it again within 2 s, so with a drifting source f0 swung by the
+ * whole run's drift in every window (and the trims were measured half at one f0, half at the other).
+ */
+export function liveWithChannels(controller: AppController, p: EngineParams): EngineParams {
+  return { ...controller.currentParams, channels: [p.channels[0], p.channels[1]] };
+}
+
+/**
+ * Step 6's autotune result, applied as the calibrated values when it improved on its start (`improved`; an
+ * aborted or unconfirmed run left the start in place): only its channels, over the live params (liveWithChannels —
+ * its own params carry the f0 and the master of the run's start, which the follower or the user moved since: f0
+ * 4 % back, out of the follower's reach, and a master 15 dB above the user's), within the solve's stability
+ * margin (capLoopGain), with its per-harmonic measurement (calibratedMeasurements: one zone only). Returns
+ * whether it applied.
+ */
+export function applyAutotuneResult(
+  controller: AppController,
+  cal: CalibrationData,
+  r: Pick<AutotuneResult, 'params' | 'aborted' | 'improved' | 'harmonics'>,
+  o: { fs: number; taps: number; separateZones: boolean },
+): boolean {
+  if (r.aborted || !r.improved) return false;
+  const capped = capLoopGain(cal, liveWithChannels(controller, r.params), o.fs, o.taps);
+  const measured = o.separateZones ? null : calibratedMeasurements(r, capped.limitedDb);
+  controller.applyParams(capped.params, { calibrated: true, harmonics: measured });
+  return true;
+}
+
+/**
+ * Autotune driver on the controller: the probes' channels through applyParams (liveWithChannels: f0
+ * keeps following the source), error level from the 'err' tap in the band (errorLevelDbfs), bypass
+ * windows with the A/B bypass (15 ms ramp) plus a settling pause. In tonal mode it also reads each
+ * harmonic on its own (measureHarmonicsDb, synchronous detection), so the search refines the
+ * per-harmonic trims. Create it right before runAutotune: the f0 it finds then is the run's start f0.
+ *
+ * The search asks for its harmonics at the start f0, while the bank follows the live one: each window reads
+ * them where the bank is, freqs and tolerances × live f0 / start f0 (the live f0 halfway through the window).
+ * Before that a +2 % step of the source left every later window reading the noise floor 40–50 dB under the
+ * tone, and the run completed blind with a false improvement. A live f0 further from the start than the
+ * search's drift tolerance (harmonicTolerancesHz: the trims' optimum moves with f0 too) stops the run, which
+ * then restores the start values (over the live f0).
  */
 export function autotuneDriver(
   controller: AppController,
   o: { fs: number; band: [number, number]; signal: AbortSignal; onMeasure: () => void },
 ): AutotuneDriver {
+  const f0Run = controller.state.params.tonal.f0;
+  /** Live f0 / the run's start f0, refused beyond the search's tolerance. */
+  const f0Ratio = (): number => {
+    const p = controller.state.params;
+    const k = p.tonal.f0 / f0Run;
+    if (!(Math.abs(k - 1) <= harmonicTolerancesHz(p, [1])[0])) {
+      throw new Error(
+        `la fondamentale si è spostata da ${formatNumber(f0Run, 2)} a ${formatNumber(p.tonal.f0, 2)} Hz durante la misura, ` +
+          'più di quanto le correzioni per armonica tollerano',
+      );
+    }
+    return k;
+  };
   const level = async (ms: number): Promise<number> => {
     const x = await recordTap(controller, 'err', ms, o.fs, o.signal);
     o.onMeasure();
     return errorLevelDbfs(x, o.fs, o.band, controller.state.params);
   };
+  /** Runs `measure` with the anti-noise bypassed (mute ramp, delay line and the room's decay first). */
+  const bypassed = async <T>(measure: () => Promise<T>): Promise<T> => {
+    controller.setBypass(true);
+    try {
+      await sleep(400, o.signal);
+      return await measure();
+    } finally {
+      controller.setBypass(false);
+    }
+  };
   return {
     signal: o.signal,
     apply(p: EngineParams) {
-      controller.applyParams(p);
+      controller.applyParams(liveWithChannels(controller, p));
     },
     settle: (ms) => sleep(ms, o.signal),
     measureErrorDb: (ms) => level(ms),
-    async measureBypassDb(ms) {
-      controller.setBypass(true);
-      try {
-        // Mute ramp, delay line and the room's decay before the window counts as "off".
-        await sleep(400, o.signal);
-        return await level(ms);
-      } finally {
-        controller.setBypass(false);
-      }
+    measureBypassDb: (ms) => bypassed(() => level(ms)),
+    measureHarmonicsDb(ms, freqs, bypass, tolHz) {
+      const levels = async (): Promise<number[]> => {
+        const before = f0Ratio();
+        const x = await recordTap(controller, 'err', ms, o.fs, o.signal);
+        o.onMeasure();
+        const k = (before + f0Ratio()) / 2;
+        return harmonicLevelsDb(x, o.fs, freqs.map((f) => f * k), tolHz?.map((t) => t * k));
+      };
+      return bypass ? bypassed(levels) : levels();
     },
   };
 }

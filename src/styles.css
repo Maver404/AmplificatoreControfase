@@ -1287,6 +1287,65 @@ main:focus {
   display: none;
 }
 
+/* «Armoniche» (tonal mode): per-harmonic gain and phase trims */
+
+.strip.is-off .strip-harm {
+  opacity: 0.55;
+}
+
+.strip-harm-count {
+  font-weight: 400;
+}
+
+.strip-harm-list {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
+.strip-harm-row {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.strip-harm-row:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.strip-harm-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 2px 12px;
+  margin: 0;
+  font-size: 0.88rem;
+}
+
+.strip-harm-title {
+  font-weight: 600;
+}
+
+.strip-harm-total strong {
+  font-family: var(--font-mono);
+}
+
+.strip-harm-controls {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
+  gap: 6px 12px;
+  min-width: 0;
+}
+
+.strip-harm-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
 /* ---------- meters ---------- */
 
 .meter {

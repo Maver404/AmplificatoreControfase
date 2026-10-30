@@ -501,6 +501,13 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* Per-harmonic attenuation (tonal mode, steps 6 and 7): one line each. */
+.wz-harmonics {
+  list-style: none;
+  padding: 0;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ---- navigation ---- */
 
 .wz-nav {

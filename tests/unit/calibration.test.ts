@@ -4,12 +4,17 @@ import type { AnalysisRequest, AnalysisResponse } from '../../src/audio/analysis
 import {
   AMP_ADVICE_DB,
   CalibrationError,
+  capLoopGain,
+  checkLoop,
   amplifierAdvice,
   amplifierLevelNoise,
   bandRmsDbfs,
   calibrationFreqs,
   createCalibration,
   defaultSweepBand,
+  DEFAULT_FEEDBACK_TAPS,
+  EXACT_NULL_DB,
+  GEOMETRY_ACCURACY_DB,
   estimateRt60,
   LOOP_GAIN_DANGER_DB,
   feedbackFirs,
@@ -18,6 +23,7 @@ import {
   measurePath,
   measurePrimary,
   pathResponse,
+  predictionCeiling,
   sanitizeCalibration,
   solutionToParams,
   solveFromCalibration,
@@ -27,9 +33,10 @@ import {
 import type { CalibrationData, MeasureFn, MeasurePathOptions, PathData } from '../../src/audio/calibration.ts';
 import type { AlignmentResult } from '../../src/dsp/alignment.ts';
 import { FEEDBACK_FIR_MARGIN } from '../../src/dsp/feedback-canceller.ts';
+import { trimForTarget } from '../../src/dsp/harmonic-trims.ts';
 import { F0Tracker, estimateF0 } from '../../src/dsp/f0-tracker.ts';
 import { irToResponse } from '../../src/dsp/latency-estimator.ts';
-import { D_MIN_SAMPLES, clampParams, computeChannelDelay, dbToLin } from '../../src/dsp/params.ts';
+import { D_MIN_SAMPLES, clampParams, computeChannelDelay, dbToLin, neutralTrims, withoutTrims } from '../../src/dsp/params.ts';
 import { channelResponse } from '../../src/dsp/response.ts';
 import { mulberry32 } from '../../src/dsp/sweep.ts';
 
@@ -1059,7 +1066,8 @@ describe('review fixes', () => {
     const far = attenuations(0.2);
     for (let h = 0; h < 4; h++) {
       expect(near[h]).toBeGreaterThan(10);
-      expect(far[h]).toBeGreaterThan(near[h] - 1);
+      // The harmonic trims null the modelled residual (a wrong P would leave the true one large).
+      expect(far[h]).toBeGreaterThan(Math.min(near[h], 60) - 1);
     }
   });
 
@@ -1078,6 +1086,479 @@ describe('review fixes', () => {
     cal.primary!.tonalF0 = 200.5;
     const harmonic = solveFromCalibration(cal, p, fs);
     expect(harmonic.advice.some((a) => a.includes('tono misurato'))).toBe(false);
+  });
+
+  /** Tonal calibration: pure-delay primary, PSD concentrated on the first four harmonics of f0. */
+  function tonalCal(f0: number, speakers: 'single' | 'shared' = 'single'): CalibrationData {
+    const cal = delayCal(0.7, 0.03, {
+      psd: (f) => {
+        const h = Math.round(f / f0);
+        return h >= 1 && h <= 4 && Math.abs(f - h * f0) < 6 ? 1 : 1e-3;
+      },
+    });
+    cal.speakers = speakers;
+    return cal;
+  }
+
+  const tonalParams = (f0: number, speakers: 'single' | 'shared' = 'single'): ReturnType<typeof clampParams> => {
+    const p = solveParams();
+    p.channels[1].enabled = speakers !== 'single';
+    p.phaseMode = 'tonal';
+    p.tonal = { f0, harmonics: 4, q: 30 };
+    return p;
+  };
+
+  /** Attenuation of the true residual P + Σ G_ch·S_ch at f (paths as tap lists), dB. */
+  function trueAttenuationDb(p: ReturnType<typeof clampParams>, f: number, paths: [[number, number][], [number, number][] | null]): number {
+    let re = 0.7 * Math.cos(-2 * Math.PI * f * 0.03);
+    let im = 0.7 * Math.sin(-2 * Math.PI * f * 0.03);
+    for (const ch of [0, 1] as const) {
+      const taps = paths[ch];
+      if (taps === null) continue;
+      const g = channelResponse(p, fs, f, ch);
+      const s = tapsAt(taps, f);
+      re += g.re * s.re - g.im * s.im;
+      im += g.re * s.im + g.im * s.re;
+    }
+    return -20 * Math.log10(Math.hypot(re, im) / 0.7);
+  }
+
+  it('tonal mode: per-harmonic trims null each harmonic that one delay cannot (one speaker)', () => {
+    const f0 = 101.37;
+    // A reflection 0.77 ms after the direct sound: the speaker's phase is far from linear across the harmonics.
+    const taps: [number, number][] = [[720, 1], [757, 0.6]];
+    const cal = tonalCal(f0);
+    cal.secondary[0] = impulsePath(taps);
+    const out = solveFromCalibration(cal, tonalParams(f0), fs);
+    const bare = withoutTrims(out.params);
+    const untrimmed = [1, 2, 3, 4].map((h) => trueAttenuationDb(bare, h * f0, [taps, null]));
+    expect(Math.min(...untrimmed)).toBeLessThan(20);
+    expect(out.harmonics!.map((x) => x.h)).toEqual([1, 2, 3, 4]);
+    for (const x of out.harmonics!) {
+      expect(x.freqHz).toBeCloseTo(x.h * f0, 9);
+      expect(trueAttenuationDb(out.params, x.freqHz, [taps, null])).toBeGreaterThan(60);
+      // an exact null of the measured model: 60 dB (a coherence is never taken as exactly 1)
+      expect(x.predictedDb).toBeGreaterThan(59.9);
+      expect(x.predictedDb).toBeLessThanOrEqual(60 + 1e-9);
+      // (within the 60 dB ceiling of the coherence)
+      expect(Math.abs(x.untrimmedDb - untrimmed[x.h - 1])).toBeLessThan(0.01);
+      expect(x.capped).toBe(false);
+      // …which is the calculation's limit, not a figure: flagged.
+      expect(x.ceiling).toBe('exact');
+    }
+    const trims = out.params.channels[0].harmonicTrims;
+    expect(trims.slice(0, 4).some((t) => Math.abs(t.phaseDeg) > 5)).toBe(true);
+    for (const t of trims.slice(0, 4)) {
+      expect(t.gainDb).toBeLessThanOrEqual(6);
+      expect(t.gainDb).toBeGreaterThanOrEqual(-30);
+    }
+    expect(trims.slice(4)).toEqual(neutralTrims().slice(4));
+    expect(out.params.channels[1].harmonicTrims).toEqual(neutralTrims());
+    expect(out.result.predictedAttenuationDb).toBeGreaterThan(25);
+    // The broadband figure includes the harmonics above the 4th, which the trims do not reach: a figure.
+    expect(out.result.predictedAttenuationDb).toBeLessThan(EXACT_NULL_DB - 1);
+    expect(out.predictionCeiling).toBeUndefined();
+  });
+
+  it('tonal mode: two speakers on one zone are trimmed per harmonic jointly', () => {
+    const f0 = 101.37;
+    const taps: [[number, number][], [number, number][]] = [[[720, 1], [757, 0.6]], [[760, 0.8], [803, -0.4]]];
+    const cal = tonalCal(f0, 'shared');
+    cal.secondary = [impulsePath(taps[0]), impulsePath(taps[1])];
+    const out = solveFromCalibration(cal, tonalParams(f0, 'shared'), fs);
+    expect(out.params.channels[0].enabled && out.params.channels[1].enabled).toBe(true);
+    for (const h of [1, 2, 3, 4]) expect(trueAttenuationDb(out.params, h * f0, taps)).toBeGreaterThan(60);
+    for (const ch of [0, 1] as const) expect(out.params.channels[ch].harmonicTrims.slice(0, 4)).not.toEqual(neutralTrims().slice(0, 4));
+  });
+
+  it('tonal mode: a harmonic out of reach even with the whole gain range is capped, without raising the gain', () => {
+    // Speaker path with a notch at 300 Hz (an echo of 0.9 inverted 160 samples later): harmonic 3 needs ≈ +24 dB,
+    // 18 dB over the trims' +6 dB, more than the channel gain can add (7.8 dB): raising the gain would buy
+    // < 1 dB there for 7.8 dB of loop gain at 300 Hz.
+    const taps: [number, number][] = [[720, 1], [880, -0.9]];
+    const cal = tonalCal(100);
+    cal.secondary[0] = impulsePath(taps);
+    const out = solveFromCalibration(cal, tonalParams(100), fs);
+    const c = out.params.channels[0];
+    const solvedGainDb = 20 * Math.log10(out.result.channels[0].gainLin);
+    expect(solvedGainDb).toBeLessThan(-7);
+    expect(c.gainDb).toBeCloseTo(solvedGainDb, 9);
+    expect(c.harmonicTrims[2].gainDb).toBeCloseTo(6, 9);
+    for (const h of [1, 2, 4]) expect(trueAttenuationDb(out.params, h * 100, [taps, null])).toBeGreaterThan(60);
+    const h3 = out.harmonics![2];
+    expect(h3.capped).toBe(true);
+    expect(out.harmonics!.filter((x) => x.capped).map((x) => x.h)).toEqual([3]);
+    expect(h3.predictedDb).toBeCloseTo(trueAttenuationDb(out.params, 300, [taps, null]), 3);
+    expect(h3.predictedDb).toBeGreaterThan(h3.untrimmedDb);
+    expect(h3.predictedDb).toBeLessThan(10);
+    expect(out.advice.some((a) => a.startsWith('Armonica 3 (300 Hz)') && a.includes('−30…+6 dB'))).toBe(true);
+    // The gain the solve needs is in range: no advice to raise the reference preamp (the notch is the cause).
+    expect(amplifierAdvice(0, solvedGainDb)).toBeNull();
+    expect(out.advice.filter((a) => a.startsWith('Canale L: serve un guadagno di'))).toEqual([]);
+  });
+
+  /** Feedback taps (one channel) through the neutraliser the app loads (feedbackFirs(cal, taps)) at f: F − F̂. */
+  function neutralisedAt(cal: CalibrationData, ch: 0 | 1, feedback: [number, number][], f: number, taps = DEFAULT_FEEDBACK_TAPS): { re: number; im: number } {
+    return neutralisedOn(cal, ch, feedback, Float64Array.of(f), taps)[0];
+  }
+
+  /** neutralisedAt on a grid (the FIR designed once). */
+  function neutralisedOn(cal: CalibrationData, ch: 0 | 1, feedback: [number, number][], freqs: Float64Array, taps = DEFAULT_FEEDBACK_TAPS): { re: number; im: number }[] {
+    const fir = feedbackFirs(cal, taps)[ch];
+    const h = fir ? irToResponse(fir.taps, fs, freqs) : null;
+    return Array.from(freqs, (f, k) => {
+      const v = tapsAt(feedback, f);
+      if (!fir || !h) return v;
+      const a = (-2 * Math.PI * f * fir.bulkDelay) / fs;
+      return { re: v.re - (h.re[k] * Math.cos(a) - h.im[k] * Math.sin(a)), im: v.im - (h.re[k] * Math.sin(a) + h.im[k] * Math.cos(a)) };
+    });
+  }
+
+  /**
+   * trueAttenuationDb through the closed loop the engine runs: the reference mic hears the noise plus the
+   * speakers through the feedback taps past the neutraliser, so the anti-noise is Σ G·S/(1 − Σ G·(F − F̂)).
+   */
+  function closedLoopAttenuationDb(
+    cal: CalibrationData,
+    p: ReturnType<typeof clampParams>,
+    f: number,
+    paths: [[number, number][] | null, [number, number][] | null],
+    feedback: [[number, number][] | null, [number, number][] | null],
+  ): number {
+    let ar = 0;
+    let ai = 0;
+    let dr = 1;
+    let di = 0;
+    for (const ch of [0, 1] as const) {
+      const g = channelResponse(p, fs, f, ch);
+      const s = paths[ch];
+      if (s !== null) {
+        const v = tapsAt(s, f);
+        ar += g.re * v.re - g.im * v.im;
+        ai += g.re * v.im + g.im * v.re;
+      }
+      const fb = feedback[ch];
+      if (fb !== null) {
+        const v = neutralisedAt(cal, ch, fb, f);
+        dr -= g.re * v.re - g.im * v.im;
+        di -= g.re * v.im + g.im * v.re;
+      }
+    }
+    const d2 = dr * dr + di * di;
+    const re = 0.7 * Math.cos(-2 * Math.PI * f * 0.03) + (ar * dr + ai * di) / d2;
+    const im = 0.7 * Math.sin(-2 * Math.PI * f * 0.03) + (ai * dr - ar * di) / d2;
+    return -20 * Math.log10(Math.hypot(re, im) / 0.7);
+  }
+
+  /** Neutralised loop of channel 0 at f through `feedback` (taps), dB. */
+  const loopOnDb = (cal: CalibrationData, p: ReturnType<typeof clampParams>, feedback: [number, number][], freqs: Float64Array): number[] => {
+    const v = neutralisedOn(cal, 0, feedback, freqs);
+    return Array.from(freqs, (f, k) => {
+      const g = channelResponse(p, fs, f, 0);
+      return 20 * Math.log10(Math.hypot(g.re * v[k].re - g.im * v[k].im, g.re * v[k].im + g.im * v[k].re));
+    });
+  };
+  const loopAtDb = (cal: CalibrationData, p: ReturnType<typeof clampParams>, feedback: [number, number][], f: number): number =>
+    loopOnDb(cal, p, feedback, Float64Array.of(f))[0];
+
+  /**
+   * Speaker → reference path with a direct sound the neutraliser covers and six late reflections (36 ms on,
+   * beyond the reach of even 1024 taps) spaced 1/300 s: they add up at 300 Hz and cancel at 100, 200 and 400 Hz,
+   * so the loop is strong at harmonic 3 only.
+   */
+  const combFeedback = (gain: number, offset = 1740): [number, number][] => [
+    [768, 0.3],
+    ...Array.from({ length: 6 }, (_, n): [number, number] => [768 + offset + 160 * n, gain]),
+  ];
+
+  it('tonal mode: a harmonic out of reach does not cost the others their cancellation through the loop margin', () => {
+    // The same notch, and a reflection 40 ms late on the speaker → reference path that a 256-tap neutraliser
+    // does not cover. A gain raised for harmonic 3 would lift the loop at 300 Hz, and the margin would take
+    // it back: no raise, harmonic 3 capped, the others nulled.
+    const taps: [number, number][] = [[720, 1], [880, -0.9]];
+    const fb: [number, number][] = [[768, 0.3], [768 + 1920, 0.4]];
+    const cal = tonalCal(100);
+    cal.secondary[0] = impulsePath(taps);
+    cal.feedback[0] = impulsePath(fb);
+    const out = solveFromCalibration(cal, tonalParams(100), fs);
+    expect(out.loopLimitedDb ?? 0).toBe(0);
+    expect(out.params.channels[0].gainDb).toBeCloseTo(20 * Math.log10(out.result.channels[0].gainLin), 9);
+    expect(checkLoop(cal, out.params, fs, DEFAULT_FEEDBACK_TAPS)!.afterDb).toBeLessThan(LOOP_GAIN_DANGER_DB - 4);
+    for (const x of out.harmonics!) if (x.h !== 3) expect(x.predictedDb).toBeGreaterThan(59.9);
+    for (const h of [1, 2, 4]) {
+      // The trims null the residual of the closed loop the engine runs. The loop is −14…−17 dB at these
+      // harmonics: an open-loop null would leave only as much attenuation there.
+      expect(closedLoopAttenuationDb(cal, out.params, h * 100, [taps, null], [fb, null])).toBeGreaterThan(60);
+      expect(trueAttenuationDb(out.params, h * 100, [taps, null])).toBeLessThan(25);
+    }
+    expect(out.harmonics![2].capped).toBe(true);
+    expect(out.harmonics![2].loopLimitedDb).toBeUndefined();
+  });
+
+  it('tonal mode: a centring raise that the loop margin would take back is not made', () => {
+    // A shallower notch (harmonic 3 needs ≈ +11 dB: reachable by raising the gain) and a speaker → reference
+    // path strong at 300 Hz only: the raise lifts the loop there above the margin, which takes it back off
+    // harmonic 3's trims. The solve compares both after the margin and keeps the trims without the raise when
+    // they predict at least as much.
+    const taps: [number, number][] = [[720, 1], [880, -0.6]];
+    const cal = tonalCal(100);
+    cal.secondary[0] = impulsePath(taps);
+    const free = solveFromCalibration(cal, tonalParams(100), fs);
+    const solvedGainDb = 20 * Math.log10(free.result.channels[0].gainLin);
+    expect(free.params.channels[0].gainDb).toBeGreaterThan(solvedGainDb + 3);
+    cal.feedback[0] = impulsePath(combFeedback(0.2));
+    const out = solveFromCalibration(cal, tonalParams(100), fs);
+    expect(out.loopLimitedDb).toBe(0);
+    expect(out.params.channels[0].gainDb).toBeCloseTo(solvedGainDb, 9);
+    expect(out.harmonics![2].loopLimitedDb).toBeGreaterThan(0);
+    for (const x of out.harmonics!) if (x.h !== 3) expect(x.predictedDb).toBeGreaterThan(59.9);
+  });
+
+  it('tonal mode: the loop margin lowers only the trims of the harmonic with strong feedback, not every gain', () => {
+    const taps: [number, number][] = [[720, 1]];
+    const fb = combFeedback(0.25);
+    const cal = tonalCal(100);
+    cal.secondary[0] = impulsePath(taps);
+    cal.feedback[0] = impulsePath(fb);
+    const out = solveFromCalibration(cal, tonalParams(100), fs);
+    const h3 = out.harmonics![2];
+    expect(out.loopLimitedDb).toBe(0);
+    expect(h3.loopLimitedDb!).toBeGreaterThan(5);
+    expect(out.harmonics!.filter((x) => x.loopLimitedDb !== undefined).map((x) => x.h)).toEqual([3]);
+    // What the solve made before the margin, and the old uniform margin on it: every gain down by about as much.
+    const free = clampParams(out.params);
+    free.channels[0].harmonicTrims[2].gainDb += h3.loopLimitedDb!;
+    expect(loopAtDb(cal, free, fb, 300)).toBeGreaterThan(LOOP_GAIN_DANGER_DB + 5);
+    const uniform = capLoopGain(cal, free, fs, DEFAULT_FEEDBACK_TAPS);
+    expect(uniform.limitedDb).toBeCloseTo(h3.loopLimitedDb!, 1);
+    const truth = (p: ReturnType<typeof clampParams>): number[] =>
+      [1, 2, 3, 4].map((h) => closedLoopAttenuationDb(cal, p, h * 100, [taps, null], [fb, null]));
+    const before = truth(uniform.params);
+    const after = truth(out.params);
+    // Measured: 6.2 / 6.2 / 4.6 / 6.2 dB with the uniform cut; per harmonic exact nulls and 4.6 dB on the 3rd.
+    for (const db of before) {
+      expect(db).toBeGreaterThan(3);
+      expect(db).toBeLessThan(7);
+    }
+    expect(after[2]).toBeCloseTo(before[2], 1);
+    for (const h of [0, 1, 3]) expect(after[h]).toBeGreaterThan(60);
+    // The prediction is the closed loop's: it matches harmonic by harmonic.
+    for (const x of out.harmonics!) {
+      if (x.h === 3) expect(x.predictedDb).toBeCloseTo(after[2], 3);
+      else expect(x.predictedDb).toBeCloseTo(EXACT_NULL_DB, 6);
+    }
+    // The loop stays within the margin on a fine grid across the band and exactly at the harmonic centres.
+    const grid = Float64Array.from({ length: Math.floor((cal.band[1] - cal.band[0]) / 0.05) + 1 }, (_, i) => cal.band[0] + 0.05 * i);
+    const max = Math.max(...loopOnDb(cal, out.params, fb, grid));
+    expect(max).toBeLessThanOrEqual(LOOP_GAIN_DANGER_DB);
+    expect(max).toBeGreaterThan(LOOP_GAIN_DANGER_DB - 0.01);
+    for (const h of [1, 2, 3, 4]) expect(loopAtDb(cal, out.params, fb, h * 100)).toBeLessThanOrEqual(LOOP_GAIN_DANGER_DB);
+    expect(checkLoop(cal, out.params, fs, DEFAULT_FEEDBACK_TAPS)!.afterDb).toBeLessThanOrEqual(LOOP_GAIN_DANGER_DB);
+    expect(capLoopGain(cal, out.params, fs, DEFAULT_FEEDBACK_TAPS).limitedDb).toBe(0);
+    expect(out.loopGainAfterDb).toBeCloseTo(checkLoop(cal, out.params, fs, DEFAULT_FEEDBACK_TAPS)!.afterDb, 9);
+    // The advice names harmonic 3 alone; no channel gain was lowered.
+    expect(out.params.channels[0].gainDb).toBeCloseTo(20 * Math.log10(out.result.channels[0].gainLin), 9);
+    const a = out.advice.find((x) => x.startsWith("Armonica 3 (300 Hz): guadagno d'anello"));
+    expect(a).toMatch(/ridotta di 5,\d dB \(attenuazione prevista 4,\d dB\); le altre armoniche non cambiano/);
+    expect(out.advice.some((x) => x.includes('Guadagni dei canali ridotti'))).toBe(false);
+  });
+
+  it('tonal mode: a harmonic needing up to the channel gain range more is covered by raising the gain (not capped)', () => {
+    // A shallower notch: harmonic 3 needs ≈ +11 dB more than the others.
+    const taps: [number, number][] = [[720, 1], [880, -0.6]];
+    const cal = tonalCal(100);
+    cal.secondary[0] = impulsePath(taps);
+    const p = tonalParams(100);
+    const out = solveFromCalibration(cal, p, fs);
+    const bare = solveFromCalibration(cal, { ...p, phaseMode: 'delay' }, fs);
+    const c = out.params.channels[0];
+    expect(c.gainDb).toBeLessThan(0);
+    expect(c.harmonicTrims[2].gainDb).toBeCloseTo(6, 9);
+    for (const x of out.harmonics!) {
+      expect(x.capped).toBe(false);
+      expect(trueAttenuationDb(out.params, x.freqHz, [taps, null])).toBeGreaterThan(60);
+    }
+    expect(out.advice.some((a) => a.startsWith('Armonic'))).toBe(false);
+    expect(bare.harmonics).toBeUndefined();
+    // The amplifier advice is about the raised gain (above −6 dB now), once.
+    expect(c.gainDb).toBeGreaterThan(bare.params.channels[0].gainDb + 3);
+    const amp = out.advice.filter((a) => a.startsWith('Canale L: serve un guadagno di'));
+    expect(c.gainDb).toBeGreaterThan(-6);
+    expect(amp).toEqual([amplifierAdvice(0, c.gainDb)]);
+  });
+
+  it('tonal mode: each zone of two separate zones gets its own exact trims', () => {
+    const f0 = 101.37;
+    const taps: [number, number][] = [[760, 0.8], [803, -0.4]];
+    const cal = tonalCal(f0);
+    cal.speakers = 'separate';
+    // As the wizard solves zone R: only its speaker path, the other speaker off.
+    cal.secondary = [null, impulsePath(taps)];
+    const p = tonalParams(f0, 'shared');
+    const out = solveFromCalibration(cal, p, fs);
+    expect(out.params.channels[0].enabled).toBe(false);
+    expect(out.params.channels[1].enabled).toBe(true);
+    for (const h of [1, 2, 3, 4]) expect(trueAttenuationDb(out.params, h * f0, [[], taps])).toBeGreaterThan(60);
+    expect(out.params.channels[1].harmonicTrims.slice(0, 4)).not.toEqual(neutralTrims().slice(0, 4));
+  });
+
+  it('tonal mode: a harmonic without coherent noise is trimmed down silently, not reported capped', () => {
+    // The source has no 4th harmonic: the error mic hears only local noise there (coherence 0.002, |P̂| 40 dB
+    // down). The model's null needs less than −30 dB: clamped, but the speaker is not the cause.
+    const f0 = 100;
+    const cal = tonalCal(f0);
+    cal.secondary[0] = impulsePath([[720, 1], [757, 0.6]]);
+    const prim = cal.primary!;
+    prim.freqs.forEach((f, k) => {
+      if (Math.abs(f - 4 * f0) < 8) {
+        prim.coherence[k] = 0.002;
+        prim.re[k] *= 0.01;
+        prim.im[k] *= 0.01;
+      }
+    });
+    const out = solveFromCalibration(cal, tonalParams(f0), fs);
+    expect(out.harmonics!.map((x) => x.capped)).toEqual([false, false, false, false]);
+    expect(out.advice.filter((a) => a.startsWith('Armonic'))).toEqual([]);
+    // little anti-noise where it could only add noise
+    expect(out.params.channels[0].harmonicTrims[3].gainDb).toBe(-30);
+    // a coherent harmonic out of range is still reported
+    const notch = tonalCal(f0);
+    notch.secondary[0] = impulsePath([[720, 1], [880, -0.9]]);
+    expect(solveFromCalibration(notch, tonalParams(f0), fs).harmonics!.filter((x) => x.capped).map((x) => x.h)).toEqual([3]);
+  });
+
+  it('tonal mode: a harmonic the loop cut would make louder gets the delay alone back, better than the floor', () => {
+    // At 300 Hz the late reflections come back in phase: there the null-solving trims cut to the margin (phase kept)
+    // would, through the closed loop, add to the noise; at the trims' floor the anti-noise is practically off there.
+    // The delay alone under its own margin (its own cut at that harmonic) does better than both: its response is
+    // given back there, and the other harmonics keep their exact nulls (no uniform cut).
+    const taps: [number, number][] = [[720, 1]];
+    const fb = combFeedback(0.4, 1710);
+    const cal = tonalCal(100);
+    cal.secondary[0] = impulsePath(taps);
+    cal.feedback[0] = impulsePath(fb);
+    const out = solveFromCalibration(cal, tonalParams(100), fs);
+    const h3 = out.harmonics![2];
+    expect(out.loopLimitedDb).toBe(0);
+    // The trims that null harmonic 3 through the closed loop: T = −p/(b − p·ℓ), b = G·S, ℓ = G·F̃ untrimmed there.
+    const bare = clampParams(out.params);
+    bare.channels[0].harmonicTrims[2] = { gainDb: 0, phaseDeg: 0 };
+    const g = channelResponse(bare, fs, 300, 0);
+    const mul = (a: { re: number; im: number }, b: { re: number; im: number }): { re: number; im: number } => ({ re: a.re * b.re - a.im * b.im, im: a.re * b.im + a.im * b.re });
+    const pr = { re: 0.7 * Math.cos(-2 * Math.PI * 300 * 0.03), im: 0.7 * Math.sin(-2 * Math.PI * 300 * 0.03) };
+    const b = mul(g, tapsAt(taps, 300));
+    const l = mul(g, neutralisedAt(cal, 0, fb, 300));
+    const pl = mul(pr, l);
+    const t = trimForTarget({ re: -pr.re, im: -pr.im }, { re: b.re - pl.re, im: b.im - pl.im });
+    const withTrim = (gainDb: number, phaseDeg = t.phaseDeg): ReturnType<typeof clampParams> => {
+      const q = clampParams(bare);
+      q.channels[0].harmonicTrims[2] = { gainDb, phaseDeg };
+      return q;
+    };
+    const at300 = (p: ReturnType<typeof clampParams>): number => closedLoopAttenuationDb(cal, p, 300, [taps, null], [fb, null]);
+    expect(at300(withTrim(t.gainDb))).toBeGreaterThan(59);
+    // Cut to the margin there: −3.9 dB; at the floor: −0.3 dB; the delay alone under its own margin: 1.9 dB.
+    const cut = withTrim(t.gainDb - (loopAtDb(cal, withTrim(t.gainDb), fb, 300) - LOOP_GAIN_DANGER_DB));
+    const floor = withTrim(-30);
+    expect(at300(cut)).toBeLessThan(-1);
+    expect(at300(floor)).toBeGreaterThan(at300(cut) + 1);
+    expect(at300(out.params)).toBeGreaterThan(at300(floor) + 1);
+    expect(h3.predictedDb).toBeCloseTo(at300(out.params), 3);
+    expect(h3.predictedDb).toBeGreaterThan(h3.untrimmedDb - 0.05);
+    // The delay alone's response (its trims reproduce it: no phase), its loop cut reported.
+    expect(out.params.channels[0].harmonicTrims[2].phaseDeg).toBe(0);
+    expect(h3.loopLimitedDb!).toBeGreaterThan(5);
+    for (const x of out.harmonics!) if (x.h !== 3) expect(x.predictedDb).toBeCloseTo(EXACT_NULL_DB, 6);
+    expect(checkLoop(cal, out.params, fs, DEFAULT_FEEDBACK_TAPS)!.afterDb).toBeLessThan(LOOP_GAIN_DANGER_DB);
+  });
+
+  it('predictionCeiling: a prediction within 0,5 dB of its model\'s ceiling is the ceiling, not a figure', () => {
+    expect(EXACT_NULL_DB).toBeCloseTo(60, 6);
+    expect(predictionCeiling(GEOMETRY_ACCURACY_DB, false)).toBe('geometry');
+    expect(predictionCeiling(GEOMETRY_ACCURACY_DB - 0.49, false)).toBe('geometry');
+    expect(predictionCeiling(GEOMETRY_ACCURACY_DB - 0.51, false)).toBeNull();
+    // With an error mic 30 dB is an ordinary figure (a coherence of 0.999), the exact null is 60 dB.
+    expect(predictionCeiling(GEOMETRY_ACCURACY_DB, true)).toBeNull();
+    expect(predictionCeiling(EXACT_NULL_DB, true)).toBe('exact');
+    expect(predictionCeiling(EXACT_NULL_DB - 0.49, true)).toBe('exact');
+    expect(predictionCeiling(EXACT_NULL_DB - 0.51, true)).toBeNull();
+    expect(predictionCeiling(NaN, true)).toBeNull();
+    expect(predictionCeiling(-Infinity, false)).toBeNull();
+  });
+
+  it('geometry only, tonal mode: the trims null the modelled residual too', () => {
+    const cal = tonalCal(100);
+    cal.geometry = { micToZoneM: 8, sourceAngleDeg: 0, speakerToZoneM: [1, 1], tempC: 20 };
+    cal.levels = { zoneDb: -40, refDb: -37 };
+    cal.secondary = [null, null];
+    cal.feedback[0] = impulsePath([[700, -0.5]]);
+    const out = solveFromGeometry(cal, tonalParams(100), fs, 0.012);
+    expect(out.params.channels[0].enabled).toBe(true);
+    expect(out.harmonics!.map((x) => x.h)).toEqual([1, 2, 3, 4]);
+    // An exact null of the geometric model: its accuracy floor, not ≈ 300 dB, and flagged as such.
+    for (const x of out.harmonics!) {
+      expect(x.predictedDb).toBeCloseTo(GEOMETRY_ACCURACY_DB, 6);
+      expect(x.ceiling).toBe('geometry');
+    }
+    expect(out.result.predictedAttenuationDb).toBeLessThanOrEqual(GEOMETRY_ACCURACY_DB);
+    expect(out.predictionCeiling).toBeUndefined();
+    // Every harmonic in the band trimmed (a 20–450 Hz band): the broadband prediction is the model's limit too.
+    const full = solveFromGeometry({ ...cal, band: [20, 450] }, tonalParams(100), fs, 0.012);
+    expect(full.harmonics!.map((x) => x.h)).toEqual([1, 2, 3, 4]);
+    expect(full.result.predictedAttenuationDb).toBeCloseTo(GEOMETRY_ACCURACY_DB, 6);
+    expect(full.predictionCeiling).toBe('geometry');
+    // The HP, Bessel LP and resonators are not linear phase: the delay alone leaves something on some harmonic.
+    expect(Math.min(...out.harmonics!.map((x) => x.untrimmedDb))).toBeLessThan(25);
+  });
+
+  it('a solve outside tonal mode starts without trims (they belong to the delay they were solved with)', () => {
+    const p = solveParams();
+    p.channels[0].harmonicTrims[1] = { gainDb: 4, phaseDeg: 30 };
+    const out = solveFromCalibration(delayCal(0.7, 0.03, { psd: midBand }), p, fs);
+    expect(out.params.channels[0].enabled).toBe(true);
+    expect(out.params.channels[0].harmonicTrims).toEqual(neutralTrims());
+    expect(out.harmonics).toBeUndefined();
+  });
+
+  it('tonal mode: the loop margin includes the trims (a +6 dB trim at the loop-gain peak triggers the cap)', () => {
+    const cal = tonalCal(100);
+    // A reflection 40 ms after the direct sound: out of reach of the neutraliser.
+    cal.feedback[0] = impulsePath([[768, 0.5], [768 + 1920, 3]]);
+    const p = tonalParams(100);
+    p.channels[0].polarityInvert = true;
+    const neutral = checkLoop(cal, p, fs, 256)!;
+    // Gains set so that the neutralised loop sits 2 dB inside the margin.
+    p.channels[0].gainDb += LOOP_GAIN_DANGER_DB - 2 - neutral.afterDb;
+    const at = checkLoop(cal, p, fs, 256)!;
+    expect(at.afterDb).toBeCloseTo(LOOP_GAIN_DANGER_DB - 2, 6);
+    expect(capLoopGain(cal, p, fs, 256).limitedDb).toBe(0);
+    // In tonal mode the loop peaks at a harmonic centre (checked there, not only on the grid).
+    const h = Math.round(at.atHz / 100);
+    expect(at.atHz).toBeCloseTo(h * 100, 9);
+    const trimmed = clampParams(p);
+    trimmed.channels[0].harmonicTrims[h - 1] = { gainDb: 6, phaseDeg: 0 };
+    const loop = checkLoop(cal, trimmed, fs, 256)!;
+    expect(loop.afterDb - at.afterDb).toBeCloseTo(6, 1);
+    expect(loop.atHz).toBeCloseTo(h * 100, 9);
+    const cap = capLoopGain(cal, trimmed, fs, 256);
+    expect(cap.limitedDb).toBeCloseTo(loop.afterDb - LOOP_GAIN_DANGER_DB, 6);
+    expect(cap.loop!.afterDb).toBeLessThanOrEqual(LOOP_GAIN_DANGER_DB);
+    expect(cap.params.channels[0].gainDb).toBeCloseTo(p.channels[0].gainDb - cap.limitedDb, 9);
+    expect(cap.params.channels[0].harmonicTrims[h - 1]).toEqual({ gainDb: 6, phaseDeg: 0 });
+  });
+
+  it('tonal mode: a harmonic peak narrower than the loop grid is not missed', () => {
+    const cal = tonalCal(100);
+    cal.feedback[0] = impulsePath([[768, 0.5]]);
+    const p = tonalParams(100);
+    // Q 200: the fundamental's peak is 0.5 Hz wide, the grid cells 2 Hz.
+    p.tonal.q = 200;
+    const loop = checkLoop(cal, p, fs, 256)!;
+    const h = Math.round(loop.atHz / 100);
+    expect(loop.atHz).toBeCloseTo(h * 100, 9);
+    const g = channelResponse(p, fs, h * 100, 0);
+    const f = tapsAt([[768, 0.5]], h * 100);
+    expect(loop.rawDb).toBeCloseTo(20 * Math.log10(Math.hypot(g.re * f.re - g.im * f.im, g.re * f.im + g.im * f.re)), 9);
   });
 
   it('two-level check: a path whose gain depends on the level is flagged, a linear noisy one is not', async () => {

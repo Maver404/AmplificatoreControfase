@@ -23,8 +23,6 @@ export interface StepEnv {
   abortOp(): void;
   /** Label of the running operation, null when idle. */
   readonly busy: string | null;
-  /** Milliseconds until the engine's rate-limited master has reached the last master set (0 = there). */
-  masterReadyInMs(): number;
   /** Re-renders the step and the navigation (after a change of `data`). */
   refresh(): void;
   /** Remembers layout and geometry in this browser. */

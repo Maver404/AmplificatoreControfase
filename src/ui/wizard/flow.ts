@@ -89,6 +89,28 @@ export interface SolutionInfo {
   advice: string[];
   /** geometryKey() the solution was computed with; null when it does not depend on the geometry. */
   geometryKey: string | null;
+  /** Tonal mode: the prediction at each harmonic the trims act on (empty or absent otherwise). */
+  harmonics?: HarmonicPrediction[];
+}
+
+/** One harmonic of a tonal solution (calibration.ts SolveOutcome.harmonics), with the zone it was solved for. */
+export interface HarmonicPrediction {
+  /** Separate zones: the zone (= its speaker's channel); null for the one shared zone. */
+  zone: 0 | 1 | null;
+  h: number;
+  freqHz: number;
+  /** Predicted attenuation with the per-harmonic trims, dB. */
+  predictedDb: number;
+  /**
+   * The same with the delay/gain/polarity solution alone under its own stability margin (calibration.ts
+   * HarmonicSolution.untrimmedDb, SolveOutcome.delayOnly: no trims of its own, but its own loop cuts, uniform or of the
+   * trims at a harmonic), dB.
+   */
+  untrimmedDb: number;
+  /** The trim needed was outside its range and was clamped: partial cancellation. */
+  capped: boolean;
+  /** dB the stability margin took off this harmonic's trims (calibration.ts HarmonicSolution.loopLimitedDb). */
+  loopLimitedDb?: number;
 }
 
 /** The saved calibration chosen at the start question (reuse / recal). */

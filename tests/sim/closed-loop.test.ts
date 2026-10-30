@@ -4,23 +4,32 @@
  */
 import { describe, expect, it } from 'vitest';
 import { inProcessAnalyzer } from '../../src/audio/analysis-client.ts';
-import { runAutotune } from '../../src/audio/autotune.ts';
+import { MAX_WINDOW_MS, autotuneTiming, runAutotune } from '../../src/audio/autotune.ts';
 import {
   bandRmsDbfs,
+  capLoopGain,
+  checkLoop,
   createCalibration,
   defaultSweepBand,
+  EXACT_NULL_DB,
   feedbackFirs,
+  LOOP_GAIN_DANGER_DB,
   looksLikeLoopback,
   measurePath,
   measurePrimary,
+  noiseBandwidthHz,
+  pathResponse,
   solveFromCalibration,
   solveFromGeometry,
 } from '../../src/audio/calibration.ts';
 import type { CalibrationData, MeasurePathOptions, SolveOutcome } from '../../src/audio/calibration.ts';
 import type { SpeakerConfig } from '../../src/dsp/alignment.ts';
+import { irToResponse } from '../../src/dsp/latency-estimator.ts';
 import { clampParams, dbToLin } from '../../src/dsp/params.ts';
 import type { EngineParams } from '../../src/dsp/params.ts';
 import { headStartSeconds, speedOfSound } from '../../src/dsp/physics.ts';
+import { channelResponse } from '../../src/dsp/response.ts';
+import { gainLimitedAttenuationDb, rt60ForAutotune } from '../../src/ui/wizard/logic.ts';
 import { SimRig, bandLevelDb, toneLevelDb } from './harness.ts';
 import type { PlantConfig } from './plant.ts';
 
@@ -125,7 +134,7 @@ describe('closed loop: calibration → alignment → engine', () => {
     expect(rig.autoMuted).toBe(false);
   }, 30000);
 
-  it('2. tonal noise with a non-causal geometry: tonal mode with f0 from estimateF0 cancels the tone ≥ 15 dB', async () => {
+  it('2. tonal noise with a non-causal geometry: tonal mode with f0 from estimateF0 cancels each harmonic ≥ 15 dB', async () => {
     const cfg = causalBroadband({
       noise: { tone: { f0: 100, amplitudes: [0.04, 0.025, 0.015, 0.01] }, broadband: { rms: 0.002 } },
       primary: { delayS: 0.005, gain: 0.7 },
@@ -144,11 +153,18 @@ describe('closed loop: calibration → alignment → engine', () => {
     expect(out.result.causal).toBe(true);
     // Whole periods are free: the tap delay stays within one period above D_MIN.
     expect(out.params.channels[0].delayMs).toBeLessThan(10);
+    // One delay cannot match every harmonic (HP, Bessel LP and the reflection are not linear phase): the
+    // per-harmonic trims do. Measured per harmonic: 17.2 / 20.0 / 17.5 / 10.4 dB without them, ≥ 40 dB with them.
+    expect(out.harmonics!.map((h) => h.h)).toEqual([1, 2, 3, 4]);
+    for (const h of out.harmonics!) {
+      expect(h.capped).toBe(false);
+      expect(h.predictedDb).toBeGreaterThanOrEqual(25);
+    }
     apply(rig, out, cal);
     const on = rig.run(2, ['err']).err!;
     const off = rig.bypassed(() => rig.run(2, ['err']).err!);
     const drop = (f: number): number => toneLevelDb(off, fs, f) - toneLevelDb(on, fs, f);
-    expect(drop(100)).toBeGreaterThanOrEqual(15);
+    for (const h of [1, 2, 3, 4]) expect(drop(100 * h)).toBeGreaterThanOrEqual(15);
     const tonalPower = (x: Float32Array): number =>
       [100, 200, 300, 400].reduce((s, f) => s + Math.pow(10, toneLevelDb(x, fs, f) / 10), 0);
     expect(10 * Math.log10(tonalPower(off) / tonalPower(on))).toBeGreaterThanOrEqual(15);
@@ -193,6 +209,37 @@ describe('closed loop: calibration → alignment → engine', () => {
     expect(separateDb).toBeLessThan(3);
     expect(jointDb - separateDb).toBeGreaterThan(10);
   }, 30000);
+
+  it('4b. two speakers on one zone, tonal: the joint per-harmonic trims cancel each harmonic ≥ 15 dB', async () => {
+    const cfg = causalBroadband({
+      noise: { tone: { f0: 100, amplitudes: [0.04, 0.025, 0.015, 0.01] }, broadband: { rms: 0.002 } },
+      primary: { delayS: 0.2, gain: 0.7 },
+      secondary: [
+        { delayS: 0.003, gain: 2, reflections: [{ delayS: 0.0025, gain: 0.3 }] },
+        { delayS: 0.0042, gain: 1.6, highpassHz: 80 },
+      ],
+      feedback: [
+        { delayS: 0.004, gain: 0.4 },
+        { delayS: 0.0035, gain: 0.4 },
+      ],
+      seed: 13,
+    });
+    const rig = new SimRig(cfg, RIG);
+    const p = calibrationParams('shared');
+    const cal = await calibrate(rig, p, 'shared');
+    p.phaseMode = 'tonal';
+    p.tonal.f0 = cal.primary!.tonalF0!;
+    const out = solveFromCalibration(cal, p, fs);
+    expect(out.params.channels[0].enabled && out.params.channels[1].enabled).toBe(true);
+    for (const ch of [0, 1] as const) expect(out.params.channels[ch].harmonicTrims.slice(0, 4).some((t) => t.gainDb !== 0 || t.phaseDeg !== 0)).toBe(true);
+    apply(rig, out, cal);
+    rig.run(1);
+    const on = rig.run(2, ['err']).err!;
+    const off = rig.bypassed(() => rig.run(2, ['err']).err!);
+    // Measured: 23.4 / 15.4 / 29.3 / 11.8 dB with the delays alone, ≈ 40–50 dB with the joint trims.
+    for (const h of [1, 2, 3, 4]) expect(toneLevelDb(off, fs, 100 * h) - toneLevelDb(on, fs, 100 * h)).toBeGreaterThanOrEqual(15);
+    expect(rig.autoMuted).toBe(false);
+  }, 60000);
 
   it('5. strong feedback: stable with the neutralisation FIRs, auto-muted (never above the ceiling) without', async () => {
     const cfg = causalBroadband({
@@ -331,6 +378,99 @@ describe('closed loop: calibration → alignment → engine', () => {
     expect(rig.autoMuted).toBe(false);
   }, 60000);
 
+  it('6c. tonal autotune: per-harmonic trims recover +20° on harmonic 3 and −3 dB on harmonic 2 (each harmonic ≥ 15 dB)', async () => {
+    const cfg = causalBroadband({
+      noise: { tone: { f0: 100, amplitudes: [0.04, 0.025, 0.015, 0.01] }, broadband: { rms: 0.002 } },
+      primary: { delayS: 0.005, gain: 0.7 },
+      seed: 21,
+    });
+    const p = calibrationParams('single');
+    const cal = await calibrate(new SimRig(cfg, RIG), p, 'single');
+    p.phaseMode = 'tonal';
+    p.tonal.f0 = cal.primary!.tonalF0!;
+    const solved = solveFromCalibration(cal, p, fs);
+    const start = clampParams(solved.params);
+    start.channels[0].harmonicTrims[2].phaseDeg += 20;
+    start.channels[0].harmonicTrims[1].gainDb -= 3;
+    const rig = new SimRig(cfg, RIG);
+    apply(rig, { ...solved, params: start }, cal);
+    const harmonics = [1, 2, 3, 4].map((h) => h * start.tonal.f0);
+    const drops = (): number[] => {
+      const on = rig.run(2, ['err']).err!;
+      const off = rig.bypassed(() => rig.run(2, ['err']).err!);
+      return harmonics.map((f) => toneLevelDb(off, fs, f) - toneLevelDb(on, fs, f));
+    };
+    // Measured: ≈ 42 / 11 / 9 / 49 dB from the detuned start, ≥ 50 dB on every harmonic after the autotune.
+    const before = drops();
+    expect(before[1]).toBeLessThan(15);
+    expect(before[2]).toBeLessThan(15);
+    const driver = rig.autotuneDriver(BAND);
+    const res = await runAutotune(driver, start, { fs, channels: [0], rt60S: 0.03, band: BAND });
+    expect(res.aborted).toBe(false);
+    expect(res.harmonics!.map((x) => x.h)).toEqual([1, 2, 3, 4]);
+    const bypass = Math.max(...driver.log.bypass);
+    for (const e of driver.log.errors) expect(e).toBeLessThanOrEqual(bypass + 1);
+    // Only the trims moved, back towards the solved ones.
+    expect(res.params.channels[0].delayMs).toBe(start.channels[0].delayMs);
+    expect(res.params.channels[0].gainDb).toBe(start.channels[0].gainDb);
+    expect(Math.abs(res.params.channels[0].harmonicTrims[2].phaseDeg - solved.params.channels[0].harmonicTrims[2].phaseDeg)).toBeLessThan(5);
+    expect(Math.abs(res.params.channels[0].harmonicTrims[1].gainDb - solved.params.channels[0].harmonicTrims[1].gainDb)).toBeLessThan(0.5);
+    // Independent check on the rig with the final parameters.
+    for (const d of drops()) expect(d).toBeGreaterThanOrEqual(15);
+    expect(rig.autoMuted).toBe(false);
+  }, 60000);
+
+  it('6d. tonal autotune with the wizard\'s windows while f0 drifts 0.2 %: the reported attenuation per harmonic is the real one', async () => {
+    // The wizard sizes the windows on noiseBandwidthHz (≈ 28 Hz for this tone: 4 s windows, a ~100 s run). An
+    // exact-frequency lock-in over 4 s reads ±0.25 Hz at −6 dB: with the source 0.2 Hz higher at the end
+    // (harmonic 4: +0.8 Hz) it read the residual tens of dB low and overstated the attenuation by up to 56 dB.
+    const amps = [0.04, 0.025, 0.015, 0.01];
+    const cfg = causalBroadband({
+      noise: { tone: { f0: 100, amplitudes: amps }, broadband: { rms: 0.002 } },
+      primary: { delayS: 0.005, gain: 0.7 },
+      seed: 21,
+    });
+    const p = calibrationParams('single');
+    const cal = await calibrate(new SimRig(cfg, RIG), p, 'single');
+    p.phaseMode = 'tonal';
+    p.tonal.f0 = cal.primary!.tonalF0!;
+    const solved = solveFromCalibration(cal, p, fs);
+    const start = clampParams(solved.params);
+    start.channels[0].harmonicTrims[2].phaseDeg += 20;
+    start.channels[0].harmonicTrims[1].gainDb -= 3;
+    const eff = noiseBandwidthHz(cal) ?? undefined;
+    const opts = { fs, channels: [0 as const], rt60S: rt60ForAutotune(cal), band: cal.band, ...(eff !== undefined ? { effectiveBandHz: eff } : {}) };
+    expect(autotuneTiming(opts).windowMs).toBe(MAX_WINDOW_MS);
+    const drift = 0.002; // Hz/s
+    const phases = [0.3, 1.1, 2.0, 4.0];
+    const drifting = causalBroadband({
+      noise: {
+        custom: (t) => {
+          const phi = 2 * Math.PI * (100 * t + (drift * t * t) / 2);
+          let v = 0;
+          for (let h = 0; h < 4; h++) v += amps[h] * Math.sin((h + 1) * phi + phases[h]);
+          return v;
+        },
+        broadband: { rms: 0.002 },
+      },
+      primary: { delayS: 0.005, gain: 0.7 },
+      seed: 21,
+    });
+    const rig = new SimRig(drifting, RIG);
+    apply(rig, { ...solved, params: start }, cal);
+    const res = await runAutotune(rig.autotuneDriver(cal.band), start, opts);
+    expect(res.aborted).toBe(false);
+    // The real attenuation now, read at the source's actual harmonics.
+    const t0 = rig.timeS;
+    const on = rig.run(2, ['err']).err!;
+    const off = rig.bypassed(() => rig.run(2, ['err']).err!);
+    const f = 100 + drift * (t0 + 1);
+    expect(f).toBeGreaterThan(100.15);
+    const actual = [1, 2, 3, 4].map((h) => toneLevelDb(off, fs, h * f) - toneLevelDb(on, fs, h * f));
+    res.harmonics!.forEach((x, i) => expect(x.bypassDb - x.endDb, `harmonic ${x.h}`).toBeLessThan(actual[i] + 6));
+    expect(rig.autoMuted).toBe(false);
+  }, 120000);
+
   describe('7. geometry only (no error mic in the engine)', () => {
     const tempC = 20;
     const c = speedOfSound(tempC);
@@ -407,4 +547,81 @@ describe('closed loop: calibration → alignment → engine', () => {
     expect(acoustic.ok).toBe(true);
     expect(looksLikeLoopback(acoustic)).toBe(false);
   }, 30000);
+
+  it("9. tonal, strong feedback at harmonic 3 only: the loop margin lowers that harmonic's trims, not every gain", async () => {
+    // Six late reflections on the speaker → reference path, 36.9 ms after the direct sound (beyond even 1024
+    // neutraliser taps) and 1/300 s apart: they add up at 300 Hz and cancel at 100, 200 and 400 Hz.
+    const comb = Array.from({ length: 6 }, (_, n) => ({ delayS: 0.036875 + n / 300, gain: 0.35 }));
+    const cfg = causalBroadband({
+      noise: { tone: { f0: 100, amplitudes: [0.04, 0.025, 0.015, 0.01] }, broadband: { rms: 0.002 } },
+      primary: { delayS: 0.005, gain: 0.7 },
+      feedback: [{ delayS: 0.004, gain: 0.4, reflections: comb }, null],
+      seed: 31,
+    });
+    const p = calibrationParams('single');
+    const cal = await calibrate(new SimRig(cfg, RIG), p, 'single');
+    p.phaseMode = 'tonal';
+    p.tonal.f0 = cal.primary!.tonalF0!;
+    const out = solveFromCalibration(cal, p, fs);
+    const h3 = out.harmonics![2];
+    expect(out.loopLimitedDb).toBe(0);
+    expect(h3.loopLimitedDb!).toBeGreaterThan(4);
+    expect(out.harmonics!.filter((x) => x.loopLimitedDb !== undefined).map((x) => x.h)).toEqual([3]);
+    // Before: the same solution under the old margin, every channel gain lowered by the excess.
+    const free = clampParams(out.params);
+    free.channels[0].harmonicTrims[2].gainDb += h3.loopLimitedDb!;
+    const uniform = capLoopGain(cal, free, fs, 256);
+    expect(uniform.limitedDb).toBeCloseTo(h3.loopLimitedDb!, 1);
+
+    // The loop of the solver's model (the measured path minus the neutraliser loaded) stays within the margin on
+    // a fine grid across the band and exactly at the harmonic centres.
+    const fir = feedbackFirs(cal, 256)[0]!;
+    const loopDb = (params: EngineParams, freqs: Float64Array): number[] => {
+      const fb = pathResponse(cal.feedback[0]!, fs, freqs);
+      const h = irToResponse(fir.taps, fs, freqs);
+      return Array.from(freqs, (f, k) => {
+        const a = (-2 * Math.PI * f * fir.bulkDelay) / fs;
+        const re = fb.re[k] - (h.re[k] * Math.cos(a) - h.im[k] * Math.sin(a));
+        const im = fb.im[k] - (h.re[k] * Math.sin(a) + h.im[k] * Math.cos(a));
+        const g = channelResponse(params, fs, f, 0);
+        return 20 * Math.log10(Math.hypot(g.re * re - g.im * im, g.re * im + g.im * re));
+      });
+    };
+    const grid = Float64Array.from({ length: Math.floor((cal.band[1] - cal.band[0]) / 0.05) + 1 }, (_, i) => cal.band[0] + 0.05 * i);
+    const fine = Math.max(...loopDb(out.params, grid));
+    expect(fine).toBeLessThanOrEqual(LOOP_GAIN_DANGER_DB);
+    expect(fine).toBeGreaterThan(LOOP_GAIN_DANGER_DB - 0.05);
+    const f0 = p.tonal.f0;
+    for (const db of loopDb(out.params, Float64Array.from([1, 2, 3, 4], (h) => h * f0))) expect(db).toBeLessThanOrEqual(LOOP_GAIN_DANGER_DB);
+    expect(checkLoop(cal, out.params, fs, 256)!.afterDb).toBeLessThanOrEqual(LOOP_GAIN_DANGER_DB);
+    // Without the margin the loop at 300 Hz is close to 0 dB.
+    expect(Math.max(...loopDb(free, Float64Array.of(3 * f0)))).toBeGreaterThan(LOOP_GAIN_DANGER_DB + 4);
+
+    const drops = (params: EngineParams): number[] => {
+      const rig = new SimRig(cfg, RIG);
+      apply(rig, { ...out, params }, cal);
+      rig.run(1);
+      const on = rig.run(2, ['err']).err!;
+      const off = rig.bypassed(() => rig.run(2, ['err']).err!);
+      expect(rig.autoMuted).toBe(false);
+      return [1, 2, 3, 4].map((h) => toneLevelDb(off, fs, 100 * h) - toneLevelDb(on, fs, 100 * h));
+    };
+    // Measured: 5.8 / 5.8 / 6.6 / 5.8 dB with the uniform cut; 58.7 / 54.9 / 6.6 / 50.8 dB per harmonic.
+    const before = drops(uniform.params);
+    const after = drops(out.params);
+    for (const d of before) expect(d).toBeLessThan(9);
+    for (const h of [0, 1, 3]) expect(after[h]).toBeGreaterThanOrEqual(40);
+    expect(Math.abs(after[2] - before[2])).toBeLessThan(0.5);
+    // Before, where the loop is low, the nulls fall to what a gain error of the uniform cut leaves.
+    for (const h of [0, 1, 3]) expect(Math.abs(before[h] - gainLimitedAttenuationDb(uniform.limitedDb))).toBeLessThan(0.5);
+    // The predictions are the closed loop's: harmonic 3 within 0.5 dB of the simulator, the others the model's
+    // exact null (60 dB, flagged as the calculation's limit).
+    expect(Math.abs(h3.predictedDb - after[2])).toBeLessThan(0.5);
+    for (const x of out.harmonics!) {
+      if (x.h === 3) continue;
+      expect(x.predictedDb).toBeCloseTo(EXACT_NULL_DB, 3);
+      expect(x.ceiling).toBe('exact');
+    }
+    expect(h3.ceiling).toBeUndefined();
+  }, 120000);
 });

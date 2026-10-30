@@ -8,3 +8,5 @@ e2e/fixtures/*.wav
 certs/
 *.tsbuildinfo
 .DS_Store
+.claude/launch.json
+review-tmp/

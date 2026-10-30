@@ -259,6 +259,11 @@ export class Plant {
   readonly block: number;
   /** Samples simulated so far. */
   private t = 0;
+
+  /** Samples simulated so far (the time base of NoiseSpec.custom and the other noise functions). */
+  get elapsedSamples(): number {
+    return this.t;
+  }
   private readonly mask: number;
   private readonly sHist: Float64Array;
   private readonly yHist: [Float64Array, Float64Array];

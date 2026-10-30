@@ -2,10 +2,11 @@
  * End-to-end tests on the e2e build (`vite build --mode e2e`, which installs window.__anc) served by
  * `vite preview` with the production Content-Security-Policy. The locally installed Google Chrome
  * plays a generated WAV as its fake microphone; the file cannot change while Chrome runs, so each
- * fixture gets its own project. Output is muted (--mute-audio): nothing reaches the speakers.
+ * fixture gets its own project, which runs only the spec written for it (FIXTURE_SPECS). Output is muted
+ * (--mute-audio): nothing reaches the speakers.
  */
 import { defineConfig } from '@playwright/test';
-import { FIXTURES, fixturePath } from './e2e/helpers.ts';
+import { FIXTURES, FIXTURE_SPECS, fixturePath } from './e2e/helpers.ts';
 
 const PORT = 4173;
 
@@ -37,6 +38,7 @@ export default defineConfig({
   },
   projects: FIXTURES.map((name) => ({
     name,
+    testMatch: `**/${FIXTURE_SPECS[name]}`,
     use: {
       launchOptions: {
         args: [

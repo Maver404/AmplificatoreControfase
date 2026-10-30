@@ -4,9 +4,24 @@
  *
  * Phase convention (single, used everywhere):
  *   total phase = polarity (0° or 180°) + Δ, with Δ = phaseDeltaDeg ∈ [-180, 180], positive = lag.
+ *   Tonal mode, at harmonic h·f0: total phase = polarity + h·Δ (through the wrapped delay D mod T) + θ_h,
+ *   with θ_h = harmonicTrims[h − 1].phaseDeg (positive = lag, on top of the delay); the trim's gainDb scales
+ *   that harmonic alone. Trims act only in tonal mode (see harmonic-trims.ts).
  */
 
 export type PhaseMode = 'delay' | 'tonal' | 'hilbert';
+
+/**
+ * Complex trim of one harmonic in tonal mode, relative to the untrimmed channel at h·f0: the channel's response
+ * there is multiplied by 10^(gainDb/20)·e^{-j·phaseDeg·π/180} (positive phase = lag).
+ */
+export interface HarmonicTrim {
+  gainDb: number;
+  phaseDeg: number;
+}
+
+/** Number of harmonic trims per channel (= RANGES.harmonics.max): entry h − 1 trims harmonic h. */
+export const MAX_HARMONICS = 8;
 
 export interface ChannelParams {
   enabled: boolean;
@@ -17,6 +32,11 @@ export interface ChannelParams {
   delayMs: number;
   /** Δ in degrees at fRef (delay/hilbert mode) or f0 (tonal mode); positive = lag. */
   phaseDeltaDeg: number;
+  /**
+   * Exactly MAX_HARMONICS entries, entry h − 1 for harmonic h. Tonal mode only; entries above tonal.harmonics
+   * or whose h·f0 ≥ 0.45·fs are ignored. All 0 = the untrimmed channel (sample-identical).
+   */
+  harmonicTrims: HarmonicTrim[];
 }
 
 export interface FilterParams {
@@ -90,6 +110,8 @@ export const RANGES = {
   f0: { min: 20, max: 2000 },
   harmonics: { min: 1, max: 8 },
   q: { min: 2, max: 200 },
+  trimGainDb: { min: -30, max: 6 },
+  trimPhaseDeg: { min: -180, max: 180 },
 } as const;
 
 /**
@@ -107,17 +129,24 @@ export const minTonalQ = (harmonics: number): number => {
   return TONAL_MIN_Q[h];
 };
 
-const DEFAULT_CHANNEL: ChannelParams = {
+/** MAX_HARMONICS untrimmed entries (a new array of new objects). */
+export const neutralTrims = (): HarmonicTrim[] =>
+  Array.from({ length: MAX_HARMONICS }, () => ({ gainDb: 0, phaseDeg: 0 }));
+
+const defaultChannel = (): ChannelParams => ({
   enabled: true,
   polarityInvert: true,
   gainDb: -20,
   delayMs: 0,
   phaseDeltaDeg: 0,
-};
+  harmonicTrims: neutralTrims(),
+});
+
+const DEFAULT_CHANNEL: ChannelParams = defaultChannel();
 
 /** Safe first-run defaults. */
 export const DEFAULT_PARAMS: EngineParams = {
-  channels: [{ ...DEFAULT_CHANNEL }, { ...DEFAULT_CHANNEL }],
+  channels: [defaultChannel(), defaultChannel()],
   filters: {
     hpEnabled: true,
     hpFreq: 20,
@@ -151,6 +180,16 @@ const bool = (v: unknown, fallback: boolean): boolean => (typeof v === 'boolean'
 const oneOf = <T>(v: unknown, options: readonly T[], fallback: T): T =>
   options.includes(v as T) ? (v as T) : fallback;
 
+/** Exactly MAX_HARMONICS new entries: clamped, missing or non-finite values 0, extra entries dropped. */
+function clampTrims(t: unknown): HarmonicTrim[] {
+  const src: unknown[] = Array.isArray(t) ? t : [];
+  const { trimGainDb: g, trimPhaseDeg: ph } = RANGES;
+  return Array.from({ length: MAX_HARMONICS }, (_, i) => {
+    const e = src[i] as Partial<HarmonicTrim> | null | undefined;
+    return { gainDb: clamp(e?.gainDb, g.min, g.max, 0), phaseDeg: clamp(e?.phaseDeg, ph.min, ph.max, 0) };
+  });
+}
+
 function clampChannel(c: Partial<ChannelParams> | undefined, gainMax: number): ChannelParams {
   const d = DEFAULT_CHANNEL;
   return {
@@ -159,13 +198,14 @@ function clampChannel(c: Partial<ChannelParams> | undefined, gainMax: number): C
     gainDb: clamp(c?.gainDb, RANGES.gainDb.min, gainMax, d.gainDb),
     delayMs: clamp(c?.delayMs, RANGES.delayMs.min, RANGES.delayMs.max, d.delayMs),
     phaseDeltaDeg: clamp(c?.phaseDeltaDeg, RANGES.phaseDeltaDeg.min, RANGES.phaseDeltaDeg.max, d.phaseDeltaDeg),
+    harmonicTrims: clampTrims(c?.harmonicTrims),
   };
 }
 
 /**
- * Returns a fully valid copy of `p`: every number clamped to its range, NaN/missing fields
+ * Returns a fully valid deep copy of `p`: every number clamped to its range, NaN/missing fields
  * replaced by defaults, gain capped at 0 dB unless unlocked, ceiling capped for headphones, tonal Q
- * raised to minTonalQ(harmonics).
+ * raised to minTonalQ(harmonics), harmonicTrims padded/truncated to MAX_HARMONICS (missing/NaN → 0).
  */
 export function clampParams(p: Partial<EngineParams> | undefined): EngineParams {
   const d = DEFAULT_PARAMS;
@@ -203,6 +243,13 @@ export function clampParams(p: Partial<EngineParams> | undefined): EngineParams 
     refChannel: oneOf(p?.refChannel, [0, 1] as const, d.refChannel),
     errorChannel: oneOf(p?.errorChannel, [0, 1, -1] as const, d.errorChannel),
   };
+}
+
+/** A valid copy of `p` with every harmonic trim neutral: the untrimmed channels (see trimForTarget). */
+export function withoutTrims(p: EngineParams): EngineParams {
+  const q = clampParams(p);
+  for (const c of q.channels) c.harmonicTrims = neutralTrims();
+  return q;
 }
 
 /** Frequency at which Δ is expressed for the current mode. */

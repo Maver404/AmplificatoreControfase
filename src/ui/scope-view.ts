@@ -7,9 +7,13 @@
  * Tap blocks are planar per TAP_CHANNELS; pushTap() only copies into fixed ring buffers (the caller
  * may recycle the block right after), drawing happens in requestAnimationFrame with fixed scratch
  * arrays. The fractional delay uses the same 3rd-order Lagrange taps as the DSP's DelayLine.
+ * 'cond' is the neutral conditioning: in tonal mode a channel's harmonic trims are not in it, and the
+ * legend says so for that channel.
  */
 import { TAP_CHANNELS } from '../audio/protocol.ts';
+import { anyTrim } from '../dsp/harmonic-trims.ts';
 import { D_MIN_SAMPLES } from '../dsp/params.ts';
+import type { EngineParams } from '../dsp/params.ts';
 import { formatDb, formatNumber, formatSigned } from './units.ts';
 
 const CH_COUNT = TAP_CHANNELS.length;
@@ -266,7 +270,27 @@ export interface ScopeViewData {
   channel?: 0 | 1;
   /** Optional note under the plot (e.g. "In modalità Hilbert la traccia attesa non include la rotazione"). */
   note?: string;
+  /**
+   * Per channel: tonal mode with harmonic trims set. The expected trace is built from the neutral 'cond' tap,
+   * so for that channel the legend and a note say it leaves the trims out.
+   */
+  trimmed?: [boolean, boolean];
 }
+
+/** Channels whose output carries harmonic trims the expected trace cannot show (tonal mode, any used trim set). */
+export function trimmedChannels(p: EngineParams): [boolean, boolean] {
+  const on = (ch: 0 | 1): boolean => p.phaseMode === 'tonal' && anyTrim(p.channels[ch].harmonicTrims ?? [], p.tonal.harmonics);
+  return [on(0), on(1)];
+}
+
+/** Legend of the expected trace. */
+export const EXPECTED_LEGEND = 'Atteso e[n] = s·g·cond[n − D]';
+/** Legend of the expected trace when the shown channel has harmonic trims (they are not in 'cond'). */
+export const EXPECTED_LEGEND_TRIMMED = `${EXPECTED_LEGEND}, senza le correzioni per armonica`;
+/** Note under the plot when the shown channel has harmonic trims. */
+export const TRIMS_NOTE =
+  'Correzioni per armonica attive su questo canale: la traccia attesa (s·g·cond[n − D]) non le include, quindi atteso e ' +
+  'uscita non coincidono del tutto e la correlazione scende. Non è un errore del DSP.';
 
 export interface ScopeView {
   /** Copies the block: the caller may recycle it as soon as this returns. */
@@ -349,8 +373,9 @@ export function createScopeView(container: HTMLElement, opts: ScopeViewOptions):
   toolbar.append(chLabel, tbLabel, freezeBtn);
 
   const legend = el('ul', 'legend');
+  const legendE = el('span', undefined, EXPECTED_LEGEND);
   for (const [cls, text] of [
-    ['legend-e', 'Atteso e[n] = s·g·cond[n − D]'],
+    ['legend-e', legendE],
     ['legend-out', 'Uscita reale'],
     ['legend-err', 'Mic d’errore'],
   ] as const) {
@@ -358,6 +383,7 @@ export function createScopeView(container: HTMLElement, opts: ScopeViewOptions):
     li.append(el('span', 'legend-swatch'), text);
     legend.append(li);
   }
+  let trimmed: [boolean, boolean] = [false, false];
 
   const wrap = el('div', 'canvas-wrap canvas-wrap--scope');
   const canvas = el('canvas');
@@ -373,8 +399,20 @@ export function createScopeView(container: HTMLElement, opts: ScopeViewOptions):
   );
   const note = el('p', 'fp-help');
   note.hidden = true;
-  root.append(toolbar, legend, wrap, readout, note);
+  const trimNote = el('p', 'fp-help scope-trim-note');
+  trimNote.hidden = true;
+  root.append(toolbar, legend, wrap, readout, note, trimNote);
   container.append(root);
+
+  /** Legend and note of the shown channel's harmonic trims (written only when they change). */
+  function renderTrims(): void {
+    const on = trimmed[selected];
+    const legendText = on ? EXPECTED_LEGEND_TRIMMED : EXPECTED_LEGEND;
+    if (legendE.textContent !== legendText) legendE.textContent = legendText;
+    trimNote.hidden = !on;
+    const noteText = on ? TRIMS_NOTE : '';
+    if (trimNote.textContent !== noteText) trimNote.textContent = noteText;
+  }
 
   const ctx = canvas.getContext('2d');
 
@@ -382,6 +420,7 @@ export function createScopeView(container: HTMLElement, opts: ScopeViewOptions):
   chSel.addEventListener('change', () => {
     const ch: 0 | 1 = chSel.value === '1' ? 1 : 0;
     selected = ch;
+    renderTrims();
     requestDraw();
     opts.onChannelChange?.(ch);
   });
@@ -636,6 +675,8 @@ export function createScopeView(container: HTMLElement, opts: ScopeViewOptions):
         chSel.value = String(selected);
         requestDraw();
       }
+      if (data.trimmed !== undefined) trimmed = [data.trimmed[0] === true, data.trimmed[1] === true];
+      renderTrims();
       if (data.note !== undefined) {
         note.textContent = data.note;
         note.hidden = data.note === '';

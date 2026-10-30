@@ -31,13 +31,13 @@ import { TAP_CHANNELS } from '../audio/protocol.ts';
 import type { Ch2Status, MeterSnapshot, WorkletInMsg } from '../audio/protocol.ts';
 import type { SpeakerConfig } from '../dsp/alignment.ts';
 import type { F0Estimate } from '../dsp/f0-tracker.ts';
-import { DEFAULT_PARAMS, clampParams } from '../dsp/params.ts';
-import type { ChannelParams, EngineParams, FilterParams, PhaseMode, TonalParams } from '../dsp/params.ts';
+import { DEFAULT_PARAMS, MAX_HARMONICS, clampParams } from '../dsp/params.ts';
+import type { ChannelParams, EngineParams, FilterParams, HarmonicTrim, PhaseMode, TonalParams } from '../dsp/params.ts';
 import { AttenuationEstimator } from './attenuation.ts';
 import type { AncPhase } from './attenuation.ts';
 import { bindKeyboard, isEditableTarget, keyAction } from './keyboard.ts';
 import type { KeyLike } from './keyboard.ts';
-import { applyChannelChange } from './link.ts';
+import { applyChannelChange, clearTrims } from './link.ts';
 import { PresetStore, mismatchWarnings } from './presets.ts';
 import type { Preset } from './presets.ts';
 import { SPECTRUM_FFT_SIZE, SpectrumAccumulator } from './spectrum.ts';
@@ -157,7 +157,13 @@ export interface ControllerState {
   // Parameters
   params: EngineParams;
   linked: boolean;
+  /** Double-click values, harmonic trims included. */
   calibratedChannels: [ChannelParams, ChannelParams] | null;
+  /**
+   * Per-harmonic attenuation that came with the calibrated values (tonal mode): the solve's prediction or the
+   * autotune's measurement (applyParams `harmonics`); null when the calibrated values came without one.
+   */
+  calibratedHarmonics: CalibratedHarmonic[] | null;
   speakers: SpeakerConfig;
   hasCalibration: boolean;
   feedbackFirActive: [boolean, boolean];
@@ -179,6 +185,18 @@ export interface ControllerState {
   presets: PresetsInfo;
   /** Guided-setup lock (Italian reason): while set the anti-noise cannot be un-muted. */
   ancLock: string | null;
+}
+
+/** One harmonic's attenuation attached to the calibrated values (ControllerState.calibratedHarmonics). */
+export interface CalibratedHarmonic {
+  /** Harmonic number (ChannelParams.harmonicTrims[h − 1]) and its frequency, Hz. */
+  h: number;
+  freqHz: number;
+  /** dB, positive = quieter: calibration.ts HarmonicSolution.predictedDb, or autotune bypassDb − endDb. */
+  attenuationDb: number;
+  source: 'predicted' | 'measured';
+  /** The solve could not null this harmonic within the trims' range (HarmonicSolution.capped). */
+  capped?: boolean;
 }
 
 export type ArmFailure = 'no-mic' | 'validation' | 'headphones-confirm' | 'measuring' | 'locked' | 'ref-input' | 'loopback';
@@ -244,6 +262,11 @@ const T_COND = TAP_CHANNELS.indexOf('cond');
 const T_ERR = TAP_CHANNELS.indexOf('err');
 
 const PREFS_KEY = 'controfase.devices.v1';
+/**
+ * Where the UI used to keep the neutraliser length on its own (a plain number). Read once into the prefs
+ * (DevicePrefs.feedbackTaps) when they have none, then removed; ignored otherwise.
+ */
+export const LEGACY_FEEDBACK_TAPS_KEY = 'controfase.feedbackTaps.v1';
 const EXPORT_FORMAT = 'controfase-presets';
 /** Before a window counts as ANC on/off: mute ramp, delay line and the acoustic decay. */
 export const PHASE_SETTLE_MS = 400;
@@ -293,6 +316,24 @@ const clampTaps = (n: number): number =>
   Number.isFinite(n) ? Math.round(Math.min(FEEDBACK_TAPS_RANGE.max, Math.max(FEEDBACK_TAPS_RANGE.min, n))) : DEFAULT_FEEDBACK_TAPS;
 
 const now = (): number => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+
+/** A channel's own copy: its harmonic trims are an array of objects (a spread would share them). */
+const copyChannel = (c: ChannelParams): ChannelParams => ({ ...c, harmonicTrims: c.harmonicTrims.map((t) => ({ ...t })) });
+
+/** Valid, copied CalibratedHarmonic entries (h in 1…MAX_HARMONICS, finite values); null when none. */
+function cleanHarmonics(list: readonly CalibratedHarmonic[] | null | undefined): CalibratedHarmonic[] | null {
+  if (!Array.isArray(list)) return null;
+  const out = list
+    .filter((x) => Number.isInteger(x?.h) && x.h >= 1 && x.h <= MAX_HARMONICS && Number.isFinite(x.freqHz) && Number.isFinite(x.attenuationDb))
+    .map((x): CalibratedHarmonic => ({
+      h: x.h,
+      freqHz: x.freqHz,
+      attenuationDb: x.attenuationDb,
+      source: x.source === 'measured' ? 'measured' : 'predicted',
+      ...(x.capped === true ? { capped: true } : {}),
+    }));
+  return out.length > 0 ? out : null;
+}
 
 function safeLocalStorage(): Storage | null {
   try {
@@ -420,6 +461,7 @@ export class AppController {
   private params: EngineParams = clampParams(DEFAULT_PARAMS);
   private linked = false;
   private calibrated: [ChannelParams, ChannelParams] | null = null;
+  private calibratedHarmonics: CalibratedHarmonic[] | null = null;
   private speakers: SpeakerConfig = 'shared';
   private calibration: unknown = null;
   /** Reference input the calibration was set (or its preset saved) with: its FIRs only fit that one. */
@@ -885,21 +927,57 @@ export class AppController {
   }
 
   /**
-   * Replaces all parameters (wizard, autotune). Clamped; the +12 dB unlock keeps its current state
-   * and the headphones flag follows validation. `softStart`: an audible output is muted, updated and
-   * soft-started (use it for big changes); `calibrated`: the channels become the double-click values.
+   * Replaces all parameters (wizard, autotune), harmonic trims included. Clamped; the +12 dB unlock keeps its
+   * current state and the headphones flag follows validation. `softStart`: an audible output is muted, updated
+   * and soft-started (use it for big changes); `calibrated`: the channels (trims included) become the
+   * double-click values, and `harmonics` (the solve's SolveOutcome.harmonics as 'predicted', or the autotune's
+   * per-harmonic result as 'measured') their per-harmonic attenuation (calibratedHarmonics; null without).
+   * In tonal mode the f0 follower changes tonal.f0 every 2 s, and the user may change the master meanwhile: a
+   * caller that copied the parameters before an await (an autotune run, its final apply included) applies only
+   * what it changed over currentParams (ops.ts liveWithChannels). Applied whole, the copy would set f0 back by
+   * the drift since (beyond the follower's 3 %, for good) and the master to the copied value.
    */
-  applyParams(p: EngineParams, opts: { softStart?: boolean; calibrated?: boolean } = {}): void {
+  applyParams(
+    p: EngineParams,
+    opts: { softStart?: boolean; calibrated?: boolean; harmonics?: readonly CalibratedHarmonic[] | null } = {},
+  ): void {
     const next = clampParams({ ...p, gainUnlocked: this.params.gainUnlocked, headphones: this.validation.headphones });
     this.sendSequence(next, opts.softStart === true && this.armed && !this.muted);
-    if (opts.calibrated === true) this.calibrated = [{ ...next.channels[0] }, { ...next.channels[1] }];
+    if (opts.calibrated === true) {
+      this.calibrated = [copyChannel(next.channels[0]), copyChannel(next.channels[1])];
+      this.calibratedHarmonics = cleanHarmonics(opts.harmonics);
+    }
     this.afterParamsChange();
   }
 
-  /** One channel strip edit; applies the L/R link (offsets kept) when linked. */
+  /**
+   * One channel strip edit; applies the L/R link (offsets kept) when linked. `changed` 'harmonicTrims': the
+   * channel's trims become next.harmonicTrims (linked: each entry's gain and phase move by the same amount on
+   * both channels, see link.ts).
+   */
   setChannel(idx: 0 | 1, next: ChannelParams, changed: keyof ChannelParams): void {
     const channels = applyChannelChange(this.params.channels, idx, next, changed, this.linked, this.params.gainUnlocked);
     this.update({ channels });
+  }
+
+  /**
+   * Harmonic trim h (1 … MAX_HARMONICS) of channel idx (tonal mode; clamped to RANGES.trimGainDb /
+   * trimPhaseDeg, a non-finite field is left as it is), through setChannel and the L/R link. A rise of more
+   * than 6 dB reaches the engine at 6 dB/s like a gain. Double-click: pass calibratedChannels[idx].harmonicTrims[h − 1].
+   */
+  setHarmonicTrim(idx: 0 | 1, h: number, trim: HarmonicTrim): void {
+    if (!Number.isInteger(h) || h < 1 || h > MAX_HARMONICS) return;
+    const c = this.params.channels[idx];
+    const harmonicTrims = c.harmonicTrims.map((t, k) => (k === h - 1 ? { gainDb: trim.gainDb, phaseDeg: trim.phaseDeg } : { ...t }));
+    this.setChannel(idx, { ...c, harmonicTrims }, 'harmonicTrims');
+  }
+
+  /**
+   * «Azzera armoniche» on channel idx: every harmonic trim of that channel to 0 — and of the other channel too
+   * while «Collega L/R» is on (link.ts clearTrims: an absolute reset is copied, never applied as a delta).
+   */
+  clearHarmonicTrims(idx: 0 | 1): void {
+    this.update({ channels: clearTrims(this.params.channels, idx, this.linked) });
   }
 
   setLinked(linked: boolean): void {
@@ -990,9 +1068,11 @@ export class AppController {
     return this.speakers;
   }
 
-  /** Values a double-click on a control returns to (null = none). */
+  /** Values a double-click on a control returns to (null = none); clears calibratedHarmonics. */
   setCalibratedChannels(ch: [ChannelParams, ChannelParams] | null): void {
-    this.calibrated = ch ? [{ ...ch[0] }, { ...ch[1] }] : null;
+    const q = ch ? clampParams({ ...this.params, channels: [ch[0], ch[1]] }) : null;
+    this.calibrated = q ? [q.channels[0], q.channels[1]] : null;
+    this.calibratedHarmonics = null;
     this.changed('state');
   }
 
@@ -1050,6 +1130,9 @@ export class AppController {
     const cap = this.loopMargin(this.params);
     if (cap.limitedDb > 0) {
       this.lowerCalibratedGains(cap.limitedDb);
+      // The per-harmonic attenuation came with the gains just lowered: it no longer holds (as after an autotune
+      // that capLoopGain lowered).
+      this.calibratedHarmonics = null;
       this.update({ channels: cap.params.channels }, false);
       this.setMessage('warn', `Neutralizzatore a ${n} tap: ${loopMarginText(cap.limitedDb)}`);
     }
@@ -1228,7 +1311,8 @@ export class AppController {
       warnings.push(refusal);
       this.emitEvent({ type: 'muted' });
     }
-    this.calibrated = [{ ...next.channels[0] }, { ...next.channels[1] }];
+    this.calibrated = [copyChannel(next.channels[0]), copyChannel(next.channels[1])];
+    this.calibratedHarmonics = null;
     this.activePresetId = p.id;
     const how = !audible
       ? 'valori applicati'
@@ -1695,20 +1779,69 @@ export class AppController {
 
   private readPrefs(): DevicePrefs {
     const d: DevicePrefs = { inputId: null, outputId: null, latencyMode: 'normal', feedbackTaps: DEFAULT_FEEDBACK_TAPS };
+    let prefs = d;
+    let hasTaps = false;
     try {
       const raw = this.prefsStorage?.getItem(PREFS_KEY);
-      if (!raw) return d;
-      const o = JSON.parse(raw) as Record<string, unknown>;
-      const str = (v: unknown): string | null => (typeof v === 'string' && v.length > 0 && v.length < 512 ? v : null);
-      return {
-        inputId: str(o['inputId']),
-        outputId: str(o['outputId']),
-        latencyMode: o['latencyMode'] === 'ultra' ? 'ultra' : 'normal',
-        feedbackTaps: typeof o['feedbackTaps'] === 'number' ? clampTaps(o['feedbackTaps']) : DEFAULT_FEEDBACK_TAPS,
-      };
+      if (raw) {
+        const o = JSON.parse(raw) as Record<string, unknown>;
+        const str = (v: unknown): string | null => (typeof v === 'string' && v.length > 0 && v.length < 512 ? v : null);
+        hasTaps = typeof o['feedbackTaps'] === 'number' && Number.isFinite(o['feedbackTaps']);
+        prefs = {
+          inputId: str(o['inputId']),
+          outputId: str(o['outputId']),
+          latencyMode: o['latencyMode'] === 'ultra' ? 'ultra' : 'normal',
+          feedbackTaps: hasTaps ? clampTaps(o['feedbackTaps'] as number) : DEFAULT_FEEDBACK_TAPS,
+        };
+      }
     } catch {
-      return d;
+      prefs = d;
     }
+    return this.migrateLegacyTaps(prefs, hasTaps);
+  }
+
+  /**
+   * One-time migration of LEGACY_FEEDBACK_TAPS_KEY: when the prefs have no neutraliser length, a valid old
+   * value (clamped to FEEDBACK_TAPS_RANGE) becomes it and is saved in the prefs; the old key is removed in
+   * any case (the prefs are the only place now).
+   */
+  private migrateLegacyTaps(prefs: DevicePrefs, hasTaps: boolean): DevicePrefs {
+    const s = this.prefsStorage;
+    if (!s) return prefs;
+    let raw: string | null = null;
+    try {
+      raw = s.getItem(LEGACY_FEEDBACK_TAPS_KEY);
+    } catch {
+      return prefs;
+    }
+    if (raw === null) return prefs;
+    let next = prefs;
+    if (!hasTaps) {
+      // A number as text ("512"), possibly JSON-quoted; blank is not 0.
+      const num = (x: unknown): number =>
+        typeof x === 'number' ? x : typeof x === 'string' && x.trim() !== '' ? Number(x) : Number.NaN;
+      let v = Number.NaN;
+      try {
+        v = num(JSON.parse(raw));
+      } catch {
+        v = num(raw);
+      }
+      if (Number.isFinite(v)) {
+        next = { ...prefs, feedbackTaps: clampTaps(v) };
+        try {
+          s.setItem(PREFS_KEY, JSON.stringify(next));
+        } catch {
+          // Not remembered: the old key stays for the next start.
+          return next;
+        }
+      }
+    }
+    try {
+      s.removeItem(LEGACY_FEEDBACK_TAPS_KEY);
+    } catch {
+      // Harmless: it is ignored once the prefs have the value.
+    }
+    return next;
   }
 
   private savePrefs(patch: Partial<DevicePrefs>): void {
@@ -1981,6 +2114,7 @@ export class AppController {
       params: this.params,
       linked: this.linked,
       calibratedChannels: this.calibrated,
+      calibratedHarmonics: this.calibratedHarmonics,
       speakers: this.speakers,
       hasCalibration: this.calibration !== null,
       feedbackFirActive: [this.firActive[0], this.firActive[1]],

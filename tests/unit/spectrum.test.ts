@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { SPECTRUM_FLOOR_DB, SpectrumAccumulator } from '../../src/app/spectrum.ts';
+import { SPECTRUM_FLOOR_DB, SpectrumAccumulator, harmonicAttenuationDb } from '../../src/app/spectrum.ts';
 
 const FS = 48000;
 
@@ -71,5 +71,45 @@ describe('SpectrumAccumulator', () => {
     s.push(new Float32Array(1024));
     expect(snap).not.toBe(s.db);
     expect(snap[16]).not.toBe(s.db[16]);
+  });
+});
+
+describe('harmonicAttenuationDb', () => {
+  const n = 8192;
+  /** Averaged spectrum of a sum of sines (f, amplitude). */
+  const spectrum = (tones: [number, number][]): Float32Array => {
+    const s = new SpectrumAccumulator({ fftSize: n });
+    const x = new Float32Array(2 * n);
+    for (const [f, a] of tones) {
+      const t = sine(2 * n, f, a);
+      for (let i = 0; i < x.length; i++) x[i] += t[i];
+    }
+    s.push(x);
+    return s.snapshot();
+  };
+
+  it('reads A = [L_err − L_ref]_off − [L_err − L_ref]_on at each harmonic', () => {
+    const f0 = 101.3;
+    const ref = spectrum([[f0, 0.2], [2 * f0, 0.1], [3 * f0, 0.05]]);
+    const errOff = spectrum([[f0, 0.1], [2 * f0, 0.05], [3 * f0, 0.02]]);
+    // ANC on: −20 dB on the fundamental, −6 dB on the 2nd, nothing on the 3rd.
+    const errOn = spectrum([[f0, 0.01], [2 * f0, 0.025], [3 * f0, 0.02]]);
+    const a = harmonicAttenuationDb({ fs: FS, fftSize: n, err: errOn, errBypass: errOff, refOn: ref, refOff: ref }, f0, 4);
+    expect(a).toHaveLength(4);
+    expect(a[0]!).toBeCloseTo(20, 1);
+    expect(a[1]!).toBeCloseTo(20 * Math.log10(2), 1);
+    expect(a[2]!).toBeCloseTo(0, 1);
+    // The reference dropping by itself (less noise while the ANC was on) is not counted as attenuation.
+    const quieter = spectrum([[f0, 0.1], [2 * f0, 0.05], [3 * f0, 0.025]]);
+    const b = harmonicAttenuationDb({ fs: FS, fftSize: n, err: errOn, errBypass: errOff, refOn: quieter, refOff: ref }, f0, 3);
+    expect(b[0]!).toBeCloseTo(20 - 20 * Math.log10(2), 1);
+  });
+
+  it('null without a spectrum or above 0.45·fs', () => {
+    const ref = spectrum([[100, 0.2]]);
+    expect(harmonicAttenuationDb({ fs: FS, fftSize: n, err: null, errBypass: ref, refOn: ref, refOff: ref }, 100, 2)).toEqual([null, null]);
+    const hi = harmonicAttenuationDb({ fs: FS, fftSize: n, err: ref, errBypass: ref, refOn: ref, refOff: ref }, 6000, 4);
+    expect(hi[3]).toBeNull();
+    expect(hi[0]).toBeCloseTo(0, 6);
   });
 });

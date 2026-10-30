@@ -4,7 +4,12 @@
  * calibration with the single mic (in the zone: speaker → zone path and noise level; back upstream:
  * noise level) or geometry only, then solveFromGeometry. Shows the amplifier advice, the predicted
  * attenuation and the loop gain. Two separate zones are solved one zone at a time; their loop gain
- * is then checked with both speakers on (they feed back into the reference mic together).
+ * is then checked with both speakers on (they feed back into the reference mic together), and a zone
+ * left without a useful attenuation keeps its speaker off (logic.ts mergeSeparateZones): the summary
+ * then names the one zone attenuated, and the autotune only offers the zone of a speaker that plays.
+ * Tonal mode: the solution includes per-harmonic trims (applied with it, shown in the channel strips'
+ * «Armoniche»), and the predicted attenuation is listed harmonic by harmonic, with and without them. A
+ * prediction at the ceiling of its model is worded as that limit, not as a figure (logic.ts ceilingText).
  */
 import type { ControllerState } from '../../app/controller.ts';
 import { runAutotune } from '../../audio/autotune.ts';
@@ -12,7 +17,6 @@ import type { AutotuneResult } from '../../audio/autotune.ts';
 import {
   bandRmsDbfs,
   CalibrationError,
-  capLoopGain,
   LOOP_GAIN_LIMIT_DB,
   measurePath,
   measurePrimary,
@@ -21,6 +25,7 @@ import {
   solveFromGeometry,
 } from '../../audio/calibration.ts';
 import type { CalibrationData, PrimaryData, SolveOutcome } from '../../audio/calibration.ts';
+import { anyTrim } from '../../dsp/harmonic-trims.ts';
 import type { EngineParams } from '../../dsp/params.ts';
 import { formatNumber } from '../units.ts';
 import { button, checkbox, el, liveNote, note, progressBar, radioCards, setListItems, setText } from './dom.ts';
@@ -31,19 +36,25 @@ import {
   CH_NAME,
   estimatedLatencyS,
   fmtDb,
-  gainLimitedAttenuationDb,
   geometryKey,
+  autotuneHarmonicTexts,
+  autotuneOutcomeText,
+  calibratedPredictions,
+  harmonicPredictionText,
+  harmonicPredictions,
   loopGuard,
+  mergeSeparateZones,
   mergeZoneSolutions,
-  mergedZonesLoop,
   parseGeometry,
   powerMeanDb,
+  predictedOutcomeText,
   rt60ForAutotune,
+  solvedWithErrorMic,
   stimulusLevels,
   toPathData,
   usefulOutcome,
 } from './logic.ts';
-import { autotuneDriver, waitSoftStart } from './ops.ts';
+import { applyAutotuneResult, autotuneDriver, waitSoftStart } from './ops.ts';
 
 type Method = 'error-mic' | 'two-position' | 'geometry';
 /** Zone index: the channel of a separate zone, or 0 for the one shared zone. */
@@ -56,6 +67,8 @@ const CAPTURE_CHOICES = [5, 10, 20] as const;
  * (automatic) feedback neutralisation and, when the solver lowered the gains for stability, by how much.
  */
 export function loopOutcomeText(raw: number | null, after: number | null, limitedDb: number): string {
+  // A cut that would read «0,0 dB» (a few hundredths at most) moves nothing the user hears.
+  if (!(limitedDb >= 0.05)) limitedDb = 0;
   let t = raw !== null ? ` Guadagno d’anello (senza neutralizzazione) ${fmtDb(raw)}.` : '';
   if (after !== null) {
     t +=
@@ -68,6 +81,10 @@ export function loopOutcomeText(raw: number | null, after: number | null, limite
 
 const zonesOf = (s: ControllerState): Zone[] => (s.speakers === 'separate' ? [0, 1] : [0]);
 const zoneName = (s: ControllerState, z: Zone): string => (s.speakers === 'separate' ? `zona della cassa ${CH_NAME[z]}` : 'zona');
+
+/** Why the autotune does not start in a separate zone whose speaker is off. */
+export const tuneZoneOffText = (z: Zone): string =>
+  `La cassa ${CH_NAME[z]} è spenta: nella zona ${CH_NAME[z]} l’autotune non ha nulla da regolare. Scegli la zona di una cassa attiva.`;
 
 export function createAlignStep(env: StepEnv): StepView {
   const { controller, data } = env;
@@ -82,6 +99,8 @@ export function createAlignStep(env: StepEnv): StepView {
   let advice: string[] = [];
   let tune: { measured: number; result: AutotuneResult | null; error: string | null } = { measured: 0, result: null, error: null };
   let tuneZone: Zone = 0;
+  /** Separate zones: the zone chosen for the autotune has its speaker off (live params). */
+  const tuneZoneOff = (s: ControllerState): boolean => s.speakers === 'separate' && !s.params.channels[tuneZone].enabled;
   /** "The mic is in the zone" confirmations of the two-position method. */
   const zoneConfirmed: [boolean, boolean] = [false, false];
 
@@ -244,25 +263,32 @@ export function createAlignStep(env: StepEnv): StepView {
     let loop = maxOf(outcomes.map((o) => o?.loopGainDb));
     let loopAfter = maxOf(outcomes.map((o) => o?.loopGainAfterDb));
     let limited = maxOf(outcomes.map((o) => o?.loopLimitedDb)) ?? 0;
+    // The predictions shown: one zone's are its outcome's (closed loop, stability margin included).
+    let shown: (SolveOutcome | null)[] = outcomes;
+    /** Separate zones: the one zone left playing (the other speaker is off); null otherwise. */
+    let onlyZone: Zone | null = null;
     if (outcomes.length > 1) {
-      if (useful.length === 1) {
-        const off = outcomes.findIndex((o) => !usefulOutcome(o));
-        if (off >= 0) advice.push(`Zona ${CH_NAME[off]}: nessuna attenuazione utile, la cassa ${CH_NAME[off]} resta spenta.`);
-      }
-      // Each zone was checked with one speaker: the merged parameters play both, so the loop and the
-      // stability limit are checked on them.
-      const merged = mergedZonesLoop(cal, params, fs, s.feedbackTaps, advice);
-      advice = merged.advice;
-      params = merged.params;
-      loop = merged.loopGainDb ?? loop;
-      loopAfter = merged.loopGainAfterDb ?? loopAfter;
-      if (merged.limitedDb > 0) {
-        limited = Math.max(limited, merged.limitedDb);
-        if (predicted !== null) predicted = Math.min(predicted, gainLimitedAttenuationDb(merged.limitedDb));
-        if (predicted !== null && predicted < 1) useful = [];
-      }
+      // Each zone was solved with its own speaker alone: the merged parameters play both (loop, stability
+      // limit and each zone's prediction checked on them; a zone they leave without a useful attenuation
+      // keeps its speaker off).
+      const z = mergeSeparateZones(cal, s.params, outcomes, fs, s.feedbackTaps, advice);
+      advice = z.advice;
+      params = z.params;
+      // Loop figures and gain reductions of the zones that play only (a zone whose speaker is off adds none).
+      const playing = z.on.map((i) => outcomes[i]);
+      loop = z.loopGainDb ?? maxOf(playing.map((o) => o?.loopGainDb));
+      loopAfter = z.loopGainAfterDb ?? maxOf(playing.map((o) => o?.loopGainAfterDb));
+      // A channel loses its zone's own cut and the merged one: the larger total.
+      limited = maxOf(playing.map((o) => (o?.loopLimitedDb ?? 0) + z.limitedDb)) ?? z.limitedDb;
+      shown = z.shown;
+      predicted = z.predictedDb;
+      useful = z.refused ? [] : z.on.map((i) => outcomes[i]!);
+      onlyZone = !z.refused && z.on.length === 1 ? z.on[0]! : null;
     }
-    const causal = outcomes.every((o) => o === null || o.result.causal);
+    // Separate zones: the alignment of the zones that play (an off speaker's zone keeps its own advice).
+    const causal = (onlyZone !== null ? [outcomes[onlyZone]] : outcomes).every((o) => o === null || o.result.causal);
+    // Tonal: the trims are part of `params` (applied below); their prediction harmonic by harmonic.
+    const harmonics = useful.length > 0 ? harmonicPredictions(shown) : [];
     // Geometry-based solutions only hold for the distances, angle and temperature they used.
     const gKey = m === 'error-mic' ? null : geometryKey(data.geometry, activeChannels(s.speakers));
     if (useful.length === 0) {
@@ -271,19 +297,28 @@ export function createAlignStep(env: StepEnv): StepView {
       env.refresh();
       return;
     }
-    // Plain-JSON copy into the controller (feedback FIRs follow), then the calibrated values.
+    // Plain-JSON copy into the controller (feedback FIRs follow), then the calibrated values (trims and,
+    // for one zone, their per-harmonic prediction included).
     controller.setCalibration(JSON.parse(JSON.stringify(cal)) as unknown);
-    controller.applyParams(params, { calibrated: true });
-    data.solution = { method: m, applied: true, predictedDb: predicted, loopGainDb: loop, causal, advice, geometryKey: gKey };
+    controller.applyParams(params, { calibrated: true, harmonics: calibratedPredictions(harmonics) });
+    data.solution = { method: m, applied: true, predictedDb: predicted, loopGainDb: loop, causal, advice, geometryKey: gKey, harmonics };
     const loopWarn = limited > 0 || (loopAfter !== null && loopAfter > LOOP_GAIN_LIMIT_DB);
     outcomeText = {
-      level: predicted !== null && predicted >= 6 && causal && !loopWarn ? 'ok' : 'warn',
+      level: predicted !== null && predicted >= 6 && causal && !loopWarn && onlyZone === null ? 'ok' : 'warn',
       text:
-        `Valori applicati (l’anti-rumore resta muto fino al passo 7). Attenuazione prevista ${predicted !== null ? fmtDb(predicted) : '—'}` +
-        `${m === 'error-mic' ? '' : ' (stima: senza mic d’errore non è misurabile)'}.${loopOutcomeText(loop, loopAfter, limited)}` +
+        `Valori applicati (l’anti-rumore resta muto fino al passo 7). ${predictedOutcomeText(predicted, m === 'error-mic')}.` +
+        (onlyZone !== null
+          ? ` Solo la zona ${CH_NAME[onlyZone]} è attenuata: la cassa ${CH_NAME[onlyZone === 0 ? 1 : 0]} resta spenta (vedi i suggerimenti).`
+          : '') +
+        loopOutcomeText(loop, loopAfter, limited) +
         (causal ? '' : ' Allineamento non causale per il rumore a banda larga: vedi i suggerimenti.'),
     };
     tune = { measured: 0, result: null, error: null };
+    // The autotune can only tune the zone whose speaker plays.
+    if (onlyZone !== null) {
+      tuneZone = onlyZone;
+      tuneZoneChoice.set(onlyZone === 1 ? '1' : '0');
+    }
     env.refresh();
   }
 
@@ -294,7 +329,8 @@ export function createAlignStep(env: StepEnv): StepView {
     const cal = calibration();
     const fs = s0.fs;
     if (cal === null || fs === null) return;
-    const blockers = unmuteBlockers(s0, data);
+    // A zone whose speaker is off has nothing to tune: the run would only measure the other speaker.
+    const blockers = tuneZoneOff(s0) ? [tuneZoneOffText(tuneZone)] : unmuteBlockers(s0, data);
     if (blockers.length > 0) {
       tune = { measured: 0, result: null, error: blockers[0] ?? null };
       env.refresh();
@@ -335,7 +371,8 @@ export function createAlignStep(env: StepEnv): StepView {
         allowed: loopGuard(cal, start, fs, taps),
       });
       tune.result = r;
-      if (!r.aborted && r.endDb < r.startDb) controller.applyParams(capLoopGain(cal, r.params, fs, taps).params, { calibrated: true });
+      // Its channels over the live values; the per-harmonic measurement replaces the solve's prediction.
+      applyAutotuneResult(controller, cal, r, { fs, taps, separateZones: s0.speakers === 'separate' });
     } catch (e) {
       if (!op.signal.aborted) tune.error = e instanceof Error ? e.message : 'Autotune non riuscito.';
     } finally {
@@ -408,6 +445,15 @@ export function createAlignStep(env: StepEnv): StepView {
   const outcome = liveNote();
   const adviceList = el('ul', 'wz-list wz-advice');
   const paramsLine = el('p', 'fp-help');
+  const harmTitle = el('h4', 'wz-sub', 'Attenuazione prevista per armonica');
+  const harmList = el('ul', 'wz-list wz-harmonics');
+  const harmHelp = el(
+    'p',
+    'fp-help',
+    'In modalità tonale la soluzione corregge anche guadagno e fase di ogni armonica (sezione «Armoniche» dei canali): ' +
+      'tra parentesi l’attenuazione con il solo ritardo e guadagno, entro lo stesso margine di stabilità (che può ridurne guadagno ' +
+      'o singole armoniche). Gli aumenti di correzione oltre 6 dB salgono a 6 dB al secondo.',
+  );
 
   const tuneZoneChoice = radioCards<'0' | '1'>(
     'Zona in cui si trova ora il mic d’errore',
@@ -417,11 +463,16 @@ export function createAlignStep(env: StepEnv): StepView {
     ],
     (v) => {
       tuneZone = v === '1' ? 1 : 0;
+      env.refresh();
     },
   );
   tuneZoneChoice.set('0');
+  /** The zone choices, in zone order. */
+  const tuneZoneInputs = Array.from(tuneZoneChoice.root.querySelectorAll('input'));
+  const tuneZoneHelp = el('p', 'fp-help');
   const tuneBtn = button('Avvia l’autotune', () => void autotune(), 'btn');
   const tuneNote = liveNote();
+  const tuneHarm = el('ul', 'wz-list wz-harmonics');
   const tuneBlock = el(
     'details',
     'advanced wz-autotune',
@@ -431,12 +482,15 @@ export function createAlignStep(env: StepEnv): StepView {
       'advanced-body',
       note(
         'warn',
-        'L’autotune ATTIVA l’anti-rumore (con il soft-start di 1,5 s) e prova piccole variazioni di ritardo e guadagno misurando il mic d’errore. ' +
+        'L’autotune ATTIVA l’anti-rumore (con il soft-start di 1,5 s) e prova piccole variazioni di ritardo e guadagno (in modalità tonale, ' +
+          'di guadagno e fase di ogni armonica) misurando il mic d’errore. ' +
           'Resta con la mano sul volume: si interrompe e ripristina i valori da solo se il rumore aumenta. Alla fine l’anti-rumore torna muto.',
       ),
       tuneZoneChoice.root,
+      tuneZoneHelp,
       el('div', 'wz-actions', tuneBtn),
       tuneNote.root,
+      tuneHarm,
     ),
   );
 
@@ -454,6 +508,9 @@ export function createAlignStep(env: StepEnv): StepView {
     outcome.root,
     adviceList,
     paramsLine,
+    harmTitle,
+    harmList,
+    harmHelp,
     tuneBlock,
   );
 
@@ -551,7 +608,8 @@ export function createAlignStep(env: StepEnv): StepView {
           activeChannels(s.speakers)
             .map((ch) =>
               c[ch].enabled
-                ? `${CH_NAME[ch]}: ritardo ${formatNumber(c[ch].delayMs, 3)} ms, guadagno ${formatNumber(c[ch].gainDb, 1)} dB, polarità ${c[ch].polarityInvert ? 'invertita (180°)' : 'diretta (0°)'}`
+                ? `${CH_NAME[ch]}: ritardo ${formatNumber(c[ch].delayMs, 3)} ms, guadagno ${formatNumber(c[ch].gainDb, 1)} dB, polarità ${c[ch].polarityInvert ? 'invertita (180°)' : 'diretta (0°)'}` +
+                  (s.params.phaseMode === 'tonal' && anyTrim(c[ch].harmonicTrims ?? [], s.params.tonal.harmonics) ? ', correzioni per armonica' : '')
                 : `${CH_NAME[ch]}: spento`,
             )
             .join(' · ') +
@@ -560,11 +618,33 @@ export function createAlignStep(env: StepEnv): StepView {
               : ''),
         );
       } else setText(paramsLine, '');
+      const harm = data.solution?.applied ? (data.solution.harmonics ?? []) : [];
+      harmTitle.hidden = harmHelp.hidden = harm.length === 0;
+      const errorMicModel = solvedWithErrorMic(data.solution);
+      setListItems(harmList, harm.map((x) => harmonicPredictionText(x, errorMicModel)));
 
       tuneBlock.hidden = !errMic || !data.solution?.applied;
       tuneZoneChoice.root.hidden = s.speakers !== 'separate';
       tuneZoneChoice.disable(busy);
-      tuneBtn.disabled = busy || unmuteBlockers(s, data).length > 0;
+      // Separate zones: a zone whose speaker is off (live params) cannot be chosen.
+      const offZones = s.speakers === 'separate' ? ([0, 1] as const).filter((z) => !s.params.channels[z].enabled) : [];
+      for (const z of offZones) tuneZoneInputs[z]!.disabled = true;
+      // One speaker left (a rebuilt step starts on zone L): the zone it plays is the one to tune.
+      if (offZones.length === 1 && offZones[0] === tuneZone) {
+        tuneZone = tuneZone === 0 ? 1 : 0;
+        tuneZoneChoice.set(tuneZone === 1 ? '1' : '0');
+      }
+      setText(
+        tuneZoneHelp,
+        offZones.length === 2
+          ? 'Entrambe le casse sono spente: nessuna zona da regolare.'
+          : offZones.length === 1
+            ? `La cassa ${CH_NAME[offZones[0]!]} è spenta: l’autotune regola solo la zona ${CH_NAME[offZones[0] === 0 ? 1 : 0]}, ` +
+              'con il mic d’errore in quella zona.'
+            : '',
+      );
+      tuneZoneHelp.hidden = offZones.length === 0;
+      tuneBtn.disabled = busy || tuneZoneOff(s) || unmuteBlockers(s, data).length > 0;
       if (running === 'Autotune') {
         tuneNote.set('warn', `Autotune in corso: misura ${tune.measured}… (anti-rumore attivo, Esc per fermare).`);
       } else if (tune.error) tuneNote.set('error', tune.error);
@@ -572,12 +652,10 @@ export function createAlignStep(env: StepEnv): StepView {
         const r = tune.result;
         tuneNote.set(
           r.aborted ? 'warn' : 'ok',
-          r.aborted
-            ? r.reason ?? 'Autotune interrotto: valori iniziali ripristinati.'
-            : `Errore nella zona da ${fmtDb(r.startDb)} a ${fmtDb(r.endDb)} (bypass ${fmtDb(r.bypassDb)}): ` +
-                (r.endDb < r.startDb ? 'valori migliorati applicati.' : 'nessun miglioramento, valori invariati.'),
+          r.aborted ? r.reason ?? 'Autotune interrotto: valori iniziali ripristinati.' : autotuneOutcomeText(r),
         );
       } else tuneNote.clear();
+      setListItems(tuneHarm, running === null && tune.result ? autotuneHarmonicTexts(tune.result) : []);
     },
     leave() {
       if (running !== null) env.abortOp();

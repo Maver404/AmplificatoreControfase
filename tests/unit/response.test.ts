@@ -1,16 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import { Biquad, coeffRampSamples, highpass, onePoleHighpass, onePoleLowpass } from '../../src/dsp/biquad.ts';
 import { besselLowpassSections } from '../../src/dsp/bessel-lp.ts';
-import { cAbs, cArg, cDelay, cDiv } from '../../src/dsp/complex.ts';
+import { cAbs, cArg, cDelay, cDiv, cMul } from '../../src/dsp/complex.ts';
 import type { Complex } from '../../src/dsp/complex.ts';
 import { DcBlocker } from '../../src/dsp/dc-blocker.ts';
 import { DelayLine } from '../../src/dsp/fractional-delay.ts';
 import { PhaseRotator } from '../../src/dsp/hilbert-pair.ts';
-import { clampParams, computeChannelDelay, dbToLin, delayCapacity, D_MIN_SAMPLES } from '../../src/dsp/params.ts';
-import type { EngineParams } from '../../src/dsp/params.ts';
+import { trimFactor, trimForTarget } from '../../src/dsp/harmonic-trims.ts';
+import { clampParams, computeChannelDelay, dbToLin, delayCapacity, D_MIN_SAMPLES, neutralTrims, withoutTrims } from '../../src/dsp/params.ts';
+import type { EngineParams, HarmonicTrim } from '../../src/dsp/params.ts';
 import { ResonatorBank } from '../../src/dsp/resonator-bank.ts';
 import {
   ConditioningChain,
+  channelConditioningResponse,
   channelResponse,
   conditioningResponse,
   groupDelaySamples,
@@ -44,6 +46,7 @@ function primitiveChain(p: EngineParams, fs: number, ch: 0 | 1): (x: number) => 
   if (p.phaseMode === 'tonal') {
     bank = new ResonatorBank(fs);
     bank.configure(p.tonal.f0, p.tonal.harmonics, p.tonal.q);
+    bank.setTrims(ch, p.channels[ch].harmonicTrims, 0);
   }
   const line = new DelayLine(delayCapacity(fs));
   const c = p.channels[ch];
@@ -57,7 +60,10 @@ function primitiveChain(p: EngineParams, fs: number, ch: 0 | 1): (x: number) => 
   return (x: number) => {
     let y = dc.process(x);
     for (const b of bq) y = b.process(y);
-    if (bank) y = bank.process(y);
+    if (bank) {
+      bank.process(y);
+      y = bank.out[ch];
+    }
     line.write(y);
     let z = line.read(d);
     if (rot) z = rot.process(z);
@@ -89,6 +95,13 @@ function expectClose(measured: Complex, predicted: Complex) {
   expect(Math.abs((cArg(ratio) * 180) / Math.PI)).toBeLessThan(0.5);
 }
 
+/** Harmonic trims from [gainDb, phaseDeg] pairs (the rest neutral). */
+function trimsOf(pairs: [number, number][]): HarmonicTrim[] {
+  const t = neutralTrims();
+  pairs.forEach(([gainDb, phaseDeg], i) => (t[i] = { gainDb, phaseDeg }));
+  return t;
+}
+
 const SCENARIOS: { name: string; fs: number; p: EngineParams; freqs: number[] }[] = [
   {
     name: 'delay mode, defaults, Δ = +30°, 3.2 ms base',
@@ -116,6 +129,19 @@ const SCENARIOS: { name: string; fs: number; p: EngineParams; freqs: number[] }[
       ch: [{ delayMs: 20, phaseDeltaDeg: 30 }, { delayMs: 47.3, phaseDeltaDeg: -100, gainDb: -3 }],
     }),
     freqs: [123.4, 246.8, 370.2, 493.6, 185.1],
+  },
+  {
+    name: 'tonal mode with harmonic trims (L ≠ R), at and between the harmonics',
+    fs: 44100,
+    p: makeParams({
+      phaseMode: 'tonal',
+      tonal: { f0: 98, harmonics: 5, q: 15 },
+      ch: [
+        { delayMs: 3, phaseDeltaDeg: 40, harmonicTrims: trimsOf([[4, 50], [-6, -120], [0, 0], [2.5, 170], [-20, 10]]) },
+        { delayMs: 11, phaseDeltaDeg: -15, gainDb: -6, harmonicTrims: trimsOf([[-3, -60], [6, 90], [-30, 0]]) },
+      ],
+    }),
+    freqs: [98, 196, 294, 392, 490, 147, 60, 700],
   },
   {
     name: 'hilbert mode, Δ = 60°, no filters but the DC blocker',
@@ -322,6 +348,72 @@ describe('channelResponse conventions', () => {
     raw.channels = [{ ...raw.channels[0], gainDb: 12 }, raw.channels[1]];
     const rel = cAbs(cDiv(channelResponse(raw, fs, 200, 0), conditioningResponse(raw, fs, 200)));
     expect(20 * Math.log10(rel)).toBeCloseTo(0, 9);
+  });
+});
+
+describe('harmonic trims in the response functions', () => {
+  const fs = 48000;
+  const trims = trimsOf([[3, 30], [-6, -45], [0, 90], [6, 180]]);
+  const p = makeParams({ phaseMode: 'tonal', tonal: { f0: 110, harmonics: 4, q: 25 }, ch: [{ harmonicTrims: trims }, {}] });
+
+  it('conditioningResponse stays neutral; channelConditioningResponse = it × the trim at each harmonic', () => {
+    const neutral = makeParams({ phaseMode: 'tonal', tonal: { f0: 110, harmonics: 4, q: 25 } });
+    for (const f of [55, 110, 165, 220, 330, 440, 1000]) {
+      expect(conditioningResponse(p, fs, f)).toEqual(conditioningResponse(neutral, fs, f));
+      expect(channelConditioningResponse(p, fs, f, 1)).toEqual(conditioningResponse(neutral, fs, f));
+    }
+    for (let h = 1; h <= 4; h++) {
+      const want = cMul(conditioningResponse(p, fs, h * 110), trimFactor(trims[h - 1]));
+      const got = channelConditioningResponse(p, fs, h * 110, 0);
+      expect(cAbs({ re: got.re - want.re, im: got.im - want.im }) / cAbs(want)).toBeLessThan(1e-5);
+      // channelResponse: the same factor on top of the delay, polarity and gains
+      const q = makeParams({ phaseMode: 'tonal', tonal: { f0: 110, harmonics: 4, q: 25 } });
+      const r = cDiv(channelResponse(p, fs, h * 110, 0), channelResponse(q, fs, h * 110, 0));
+      const t = trimFactor(trims[h - 1]);
+      expect(cAbs({ re: r.re - t.re, im: r.im - t.im })).toBeLessThan(1e-9);
+    }
+    // outside tonal mode trims do nothing
+    const d = makeParams({ ch: [{ harmonicTrims: trims }, {}] });
+    expect(channelResponse(d, fs, 220, 0)).toEqual(channelResponse(makeParams({}), fs, 220, 0));
+  });
+
+  it('trimForTarget + withoutTrims give the trims that put the channel response on any target at each harmonic', () => {
+    const q = makeParams({ phaseMode: 'tonal', tonal: { f0: 90, harmonics: 6, q: 20 }, ch: [{ delayMs: 7, phaseDeltaDeg: 33, harmonicTrims: trims }, {}] });
+    const untrimmed = withoutTrims(q);
+    const targets = [1, 2, 3, 4, 5, 6].map((h) => {
+      const cur = channelResponse(untrimmed, fs, h * 90, 0);
+      const g = 0.5 + 0.2 * h; // within −30…+6 dB of the untrimmed response
+      const a = 0.4 * h - 1.3;
+      return cMul(cur, { re: g * Math.cos(a), im: g * Math.sin(a) });
+    });
+    const set = clampParams(q);
+    for (let h = 1; h <= 6; h++) {
+      set.channels[0].harmonicTrims[h - 1] = trimForTarget(targets[h - 1], channelResponse(untrimmed, fs, h * 90, 0));
+    }
+    for (let h = 1; h <= 6; h++) {
+      const got = channelResponse(set, fs, h * 90, 0);
+      const want = targets[h - 1];
+      expect(cAbs({ re: got.re - want.re, im: got.im - want.im }) / cAbs(want)).toBeLessThan(1e-9);
+    }
+  });
+
+  it('ConditioningChain.channelOut: exactly the neutral output when untrimmed or not tonal, the trimmed bank otherwise', () => {
+    for (const mode of ['delay', 'tonal', 'hilbert'] as const) {
+      const q = makeParams({ phaseMode: mode, tonal: { f0: 110, harmonics: 4, q: 25 } });
+      const chain = new ConditioningChain(fs, q);
+      chain.setTrims(0, trims, 0);
+      for (let n = 0; n < 4000; n++) {
+        const y = chain.process(Math.sin(n * 0.037) + 0.3 * Math.sin(n * 0.11));
+        expect(chain.channelOut[1]).toBe(y);
+        if (mode !== 'tonal') expect(chain.channelOut[0]).toBe(y);
+      }
+    }
+    const chain = new ConditioningChain(fs, p);
+    chain.setTrims(0, trims, 0);
+    for (const f of [110, 220, 165, 700]) {
+      const m = measure((x) => (chain.process(x), chain.channelOut[0]), fs, f);
+      expectClose(m, channelConditioningResponse(p, fs, f, 0));
+    }
   });
 });
 

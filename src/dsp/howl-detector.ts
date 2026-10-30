@@ -8,10 +8,16 @@
  * but whatever its spectrum, a howl with loop delay L repeats itself every L (the speaker plays back
  * what the mic picked up L earlier), so its waveform is periodic, and while it grows its total level
  * rises faster than the commanded gain explains. The rules below use all three signatures.
+ *
+ * The periodicity analysis follows the band the conditioning chain passes (setBandHz, from the engine's
+ * message handler): up to ~2 kHz it runs at ~6 kHz (band ≤ ~2.4 kHz), as cheaply as possible; a wider chain
+ * (Bessel LP above 2 kHz or off, tonal harmonics above it) is analysed at the decimated ~12 kHz (band
+ * ≤ ~4.8 kHz), so that a dense-comb howl at 2.4–4.8 kHz with no narrow peak is seen as periodic too.
  */
 import type { HowlReason } from '../audio/protocol.ts';
 import { Biquad, lowpass } from './biquad.ts';
 import { FFT } from './fft.ts';
+import type { EngineParams } from './params.ts';
 
 export interface HowlState {
   triggered: boolean;
@@ -30,7 +36,7 @@ export const HOWL_LIMITER_GR_DB = 3;
 export const HOWL_LIMITER_MS = 300;
 export const HOWL_OVERLOAD_MARGIN_DB = 4;
 export const HOWL_OVERLOAD_MS = 200;
-/** Loop delays the main periodicity analysis looks for (~6 kHz, band ≤ ~2.4 kHz). */
+/** Loop delays the main periodicity analysis looks for (~6 kHz, band ≤ ~2.4 kHz; ~12 kHz for a wide chain). */
 export const HOWL_LOOP_MIN_MS = 5;
 export const HOWL_LOOP_MAX_MS = 600;
 /**
@@ -66,6 +72,30 @@ export const HOWL_SAT_LEVEL_DB = 12;
  * ceiling needs almost none, and plays (the former backstop allowed 0.5 dB too).
  */
 export const HOWL_SAT_GR_DB = 0.5;
+/**
+ * A chain whose band reaches above this (howlBandHz) has the main periodicity analysed at the decimated rate
+ * (~12 kHz, band ≤ ~4.8 kHz) instead of ~6 kHz; …
+ */
+export const HOWL_WIDE_BAND_HZ = 2000;
+/**
+ * … back at ~6 kHz once the band is no wider than this. The gap keeps a band edge that moves around 2 kHz
+ * (a tracked f0 with 8 harmonics, a dragged LP cutoff) from restarting the analysis at every crossing.
+ */
+export const HOWL_NARROW_BAND_HZ = 1600;
+
+/**
+ * Upper edge of the band the conditioning chain passes, Hz, for HowlDetector.setBandHz (clamped params):
+ * the Bessel LP cutoff when it is enabled; in tonal mode at most the upper −3 dB edge of the top harmonic's
+ * band, harmonics·f0·(1 + 1/(2Q)); Infinity when nothing bounds it. HP and barrier shape only the low end.
+ */
+export function howlBandHz(p: EngineParams): number {
+  let hz = p.filters.lpEnabled ? p.filters.lpFreq : Infinity;
+  if (p.phaseMode === 'tonal') {
+    const t = p.tonal;
+    hz = Math.min(hz, t.harmonics * t.f0 * (1 + 1 / (2 * t.q)));
+  }
+  return hz;
+}
 
 /** 50 % overlap: a new spectrum every ~21 ms. */
 const HOP = HOWL_FFT_SIZE / 2;
@@ -112,7 +142,11 @@ const LOCAL_OUTER = 16;
 /** Anti-alias low-pass: 6th-order Butterworth at 0.4·decimated rate; peaks are searched below it. */
 const AA_FRACTION = 0.4;
 const AA_Q = [0.5176380902, 0.7071067812, 1.9318516526];
-/** Periodicity runs at half the decimated rate (~6 kHz, band ≤ ~2.4 kHz) behind a 4th-order Butterworth. */
+/**
+ * Periodicity runs at half the decimated rate (~6 kHz, band ≤ ~2.4 kHz) behind a 4th-order Butterworth; for a
+ * wide chain at the decimated rate itself, behind the main anti-alias filter (twice the samples: one more
+ * FFT stage for the same lags and window).
+ */
 const PER_AA_Q = [0.5411961001, 1.3065629649];
 const PER_MIN_RATE = 9000;
 /** Each periodicity analysis completes within about this time (its work is spread evenly over it). */
@@ -167,6 +201,13 @@ export interface PeriodicityOptions {
   lagMaxMs?: number;
   /** Each analysis completes within about this time (default 60 ms). */
   spreadMs?: number;
+  /**
+   * |ρ(τ)| from the envelope of the correlation (the magnitude of its analytic signal) instead of its value
+   * (default false). A band-pass howl's correlation oscillates at its centre frequency f: on the lag grid
+   * its peak can fall half a sample from the loop delay, cos(π·f/rate) below the envelope (0.63 for
+   * 3.4 kHz at 12 kHz). The envelope is smooth over a sample. Same cost.
+   */
+  envelope?: boolean;
 }
 
 /**
@@ -175,8 +216,10 @@ export interface PeriodicityOptions {
  * sums running over the latest window W (FFT size minus the longest lag: 8192 points, ~0.77 s at 6 kHz).
  * A howl with loop delay L gives |ρ(L)| ≈ 0.9–1 (the sign follows the loop polarity), broadband noise
  * ≲ 0.2, tones ≈ 1. A new analysis starts every `everyMs`; its FFT work (one complex FFT for both real
- * sequences, the cross-spectrum, one inverse) is cut into bounded slices, one per push(), so that it
- * completes in `spreadMs` and no single render quantum carries more than a slice per sample.
+ * sequences, the cross-spectrum, one inverse; two radix-2 stages per pass over the arrays) is cut into
+ * bounded slices, one per push(), so that it completes in `spreadMs` and no single render quantum carries
+ * more than a slice per sample (a slice may run 3 units over its budget, taken off the next one). With
+ * `envelope`, |ρ(τ)| is the envelope of the correlation (see PeriodicityOptions.envelope).
  */
 export class PeriodicityAnalyzer {
   readonly rate: number;
@@ -189,6 +232,8 @@ export class PeriodicityAnalyzer {
   readonly windowSamples: number;
   /** Work units (copied samples, butterflies, 2 per spectrum pair, lags) done per push() while analysing. */
   readonly budget: number;
+  /** |ρ| is taken from the correlation's envelope (PeriodicityOptions.envelope). */
+  readonly envelope: boolean;
   private readonly log2N: number;
   private readonly n: number;
   private readonly mask: number;
@@ -214,12 +259,15 @@ export class PeriodicityAnalyzer {
   private bestLag = 0;
   private r1 = 0;
   private r2 = 0;
+  /** Work units a radix-2² slice did beyond its budget (≤ 3): the next slice is that much shorter. */
+  private debt = 0;
 
   private rhoOut = 0;
   private rhoPrev = 0;
   private lagOut = 0;
   /** Samples since the end of the window of the latest completed analysis. */
   private age = Infinity;
+  private done = 0;
 
   constructor(rate: number, everyMs = HOWL_PERIODIC_EVERY_MS, o: PeriodicityOptions = {}) {
     if (!(rate > 0)) throw new RangeError('PeriodicityAnalyzer: rate must be positive');
@@ -241,6 +289,7 @@ export class PeriodicityAnalyzer {
     this.lagMinSamples = Math.max(2, Math.round(((o.lagMinMs ?? HOWL_LOOP_MIN_MS) / 1000) * rate));
     this.lagMaxSamples = Math.max(this.lagMinSamples + 2, Math.min(N >> 1, Math.round(((o.lagMaxMs ?? HOWL_LOOP_MAX_MS) / 1000) * rate)));
     this.windowSamples = N - this.lagMaxSamples - 2;
+    this.envelope = o.envelope === true;
     for (let k = 0; k < N / 2; k++) {
       const a = (2 * Math.PI * k) / N;
       this.cosT[k] = Math.cos(a);
@@ -272,6 +321,11 @@ export class PeriodicityAnalyzer {
     return (this.age * 1000) / this.rate;
   }
 
+  /** Analyses completed since construction or reset(). */
+  get analyses(): number {
+    return this.done;
+  }
+
   reset(): void {
     this.pos = 0;
     this.count = 0;
@@ -281,6 +335,8 @@ export class PeriodicityAnalyzer {
     this.rhoPrev = 0;
     this.lagOut = 0;
     this.age = Infinity;
+    this.done = 0;
+    this.debt = 0;
   }
 
   push(x: number): void {
@@ -304,13 +360,23 @@ export class PeriodicityAnalyzer {
     }
   }
 
+  private startSearch(): void {
+    this.phase = P_SEARCH;
+    this.cursor = this.lagMinSamples - 1;
+    this.best = 0;
+    this.bestLag = 0;
+    this.r1 = 0;
+    this.r2 = 0;
+  }
+
   private work(budget: number): void {
     const N = this.n;
     const LOG2 = this.log2N;
     const MASK = this.mask;
     const re = this.re;
     const im = this.im;
-    let left = budget;
+    let left = budget - this.debt;
+    this.debt = left < 0 ? -left : 0;
     while (left > 0) {
       switch (this.phase) {
         case P_COPY: {
@@ -338,6 +404,72 @@ export class PeriodicityAnalyzer {
           const s = this.stage;
           const hb = LOG2 - 1 - s;
           const half = 1 << hb;
+          if (s + 1 < LOG2) {
+            // Stages s and s + 1 in one pass over the arrays (radix 2²): the same butterflies, in registers.
+            // Group q: points i0, i1 = i0 + half/2, i2 = i0 + half, i3 = i2 + half/2 (4 work units).
+            const qh = half >> 1;
+            const groups = N >> 2;
+            const end = Math.min(groups, this.cursor + ((left + 3) >> 2));
+            for (let q = this.cursor; q < end; q++) {
+              const j = q & (qh - 1);
+              const i0 = ((q >> (hb - 1)) << (hb + 1)) + j;
+              const i1 = i0 + qh;
+              const i2 = i0 + half;
+              const i3 = i2 + qh;
+              const k0 = j << s;
+              const k1 = (j + qh) << s;
+              const k2 = j << (s + 1);
+              const c0 = this.cosT[k0];
+              const s0 = this.sinT[k0];
+              const c1 = this.cosT[k1];
+              const s1 = this.sinT[k1];
+              const c2 = this.cosT[k2];
+              const s2 = this.sinT[k2];
+              const x0r = re[i0];
+              const x0i = im[i0];
+              const x1r = re[i1];
+              const x1i = im[i1];
+              const x2r = re[i2];
+              const x2i = im[i2];
+              const x3r = re[i3];
+              const x3i = im[i3];
+              // Stage s: (i0, i2) and (i1, i3).
+              const a0r = x0r + x2r;
+              const a0i = x0i + x2i;
+              let dr = x0r - x2r;
+              let di = x0i - x2i;
+              const a2r = dr * c0 + di * s0;
+              const a2i = di * c0 - dr * s0;
+              const a1r = x1r + x3r;
+              const a1i = x1i + x3i;
+              dr = x1r - x3r;
+              di = x1i - x3i;
+              const a3r = dr * c1 + di * s1;
+              const a3i = di * c1 - dr * s1;
+              // Stage s + 1: (i0, i1) and (i2, i3).
+              re[i0] = a0r + a1r;
+              im[i0] = a0i + a1i;
+              dr = a0r - a1r;
+              di = a0i - a1i;
+              re[i1] = dr * c2 + di * s2;
+              im[i1] = di * c2 - dr * s2;
+              re[i2] = a2r + a3r;
+              im[i2] = a2i + a3i;
+              dr = a2r - a3r;
+              di = a2i - a3i;
+              re[i3] = dr * c2 + di * s2;
+              im[i3] = di * c2 - dr * s2;
+            }
+            left -= 4 * (end - this.cursor);
+            if (left < 0) this.debt = -left;
+            this.cursor = end;
+            if (end === groups) {
+              this.cursor = 0;
+              this.stage += 2;
+              if (this.stage === LOG2) this.phase = P_SPLIT;
+            }
+            break;
+          }
           const end = Math.min(N >> 1, this.cursor + left);
           for (let q = this.cursor; q < end; q++) {
             const j = q & (half - 1);
@@ -367,8 +499,10 @@ export class PeriodicityAnalyzer {
         }
         case P_SPLIT: {
           // Z = FFT(a + j·b) with a, b real: A = (Z[k] + Z*[N−k])/2, B = (Z[k] − Z*[N−k])/2j.
-          // C = A·B* (the cross-spectrum, whose inverse is Σ a[n]·b[n−τ]); C[N−k] = C*[k].
+          // C = A·B* (the cross-spectrum, whose inverse is Σ a[n]·b[n−τ]); C[N−k] = C*[k]. Envelope: the
+          // analytic spectrum instead (2·C for 0 < k < N/2, 0 above), whose inverse is c + j·Hilbert(c).
           const end = Math.min((N >> 1) + 1, this.cursor + (left >> 1) + 1);
+          const env = this.envelope;
           for (let k = this.cursor; k < end; k++) {
             const ik = this.rev[k];
             const inn = this.rev[(N - k) & MASK];
@@ -382,9 +516,17 @@ export class PeriodicityAnalyzer {
             const bi = -0.5 * (zr - nr);
             const cr = ar * br + ai * bi;
             const ci = ai * br - ar * bi;
-            re[ik] = cr;
-            im[ik] = ci;
-            if (inn !== ik) {
+            if (inn === ik) {
+              re[ik] = cr;
+              im[ik] = ci;
+            } else if (env) {
+              re[ik] = 2 * cr;
+              im[ik] = 2 * ci;
+              re[inn] = 0;
+              im[inn] = 0;
+            } else {
+              re[ik] = cr;
+              im[ik] = ci;
               re[inn] = cr;
               im[inn] = -ci;
             }
@@ -402,6 +544,72 @@ export class PeriodicityAnalyzer {
           // Decimation in time: bit-reversed order in, natural order out, w = e^{+j2πk/N} (unscaled).
           const s = this.stage;
           const half = 1 << s;
+          if (s + 1 < LOG2) {
+            // Stages s and s + 1 in one pass (radix 2², as in P_FWD). Group q: points i0, i1 = i0 + half,
+            // i2 = i0 + 2·half, i3 = i2 + half.
+            const groups = N >> 2;
+            const end = Math.min(groups, this.cursor + ((left + 3) >> 2));
+            const sh = LOG2 - 2 - s;
+            for (let q = this.cursor; q < end; q++) {
+              const j = q & (half - 1);
+              const i0 = ((q >> s) << (s + 2)) + j;
+              const i1 = i0 + half;
+              const i2 = i1 + half;
+              const i3 = i2 + half;
+              const k0 = j << (sh + 1);
+              const k1 = j << sh;
+              const k2 = (j + half) << sh;
+              const c0 = this.cosT[k0];
+              const s0 = this.sinT[k0];
+              const c1 = this.cosT[k1];
+              const s1 = this.sinT[k1];
+              const c2 = this.cosT[k2];
+              const s2 = this.sinT[k2];
+              const x0r = re[i0];
+              const x0i = im[i0];
+              const x2r = re[i2];
+              const x2i = im[i2];
+              // Stage s: (i0, i1) and (i2, i3), the same twiddle.
+              let xr = re[i1];
+              let xi = im[i1];
+              let tr = xr * c0 - xi * s0;
+              let ti = xr * s0 + xi * c0;
+              const a1r = x0r - tr;
+              const a1i = x0i - ti;
+              const a0r = x0r + tr;
+              const a0i = x0i + ti;
+              xr = re[i3];
+              xi = im[i3];
+              tr = xr * c0 - xi * s0;
+              ti = xr * s0 + xi * c0;
+              const a3r = x2r - tr;
+              const a3i = x2i - ti;
+              const a2r = x2r + tr;
+              const a2i = x2i + ti;
+              // Stage s + 1: (i0, i2) and (i1, i3).
+              tr = a2r * c1 - a2i * s1;
+              ti = a2r * s1 + a2i * c1;
+              re[i2] = a0r - tr;
+              im[i2] = a0i - ti;
+              re[i0] = a0r + tr;
+              im[i0] = a0i + ti;
+              tr = a3r * c2 - a3i * s2;
+              ti = a3r * s2 + a3i * c2;
+              re[i3] = a1r - tr;
+              im[i3] = a1i - ti;
+              re[i1] = a1r + tr;
+              im[i1] = a1i + ti;
+            }
+            left -= 4 * (end - this.cursor);
+            if (left < 0) this.debt = -left;
+            this.cursor = end;
+            if (end === groups) {
+              this.cursor = 0;
+              this.stage += 2;
+              if (this.stage === LOG2) this.startSearch();
+            }
+            break;
+          }
           const end = Math.min(N >> 1, this.cursor + left);
           for (let q = this.cursor; q < end; q++) {
             const j = q & (half - 1);
@@ -423,14 +631,7 @@ export class PeriodicityAnalyzer {
           this.cursor = end;
           if (end === N >> 1) {
             this.cursor = 0;
-            if (++this.stage === LOG2) {
-              this.phase = P_SEARCH;
-              this.cursor = this.lagMinSamples - 1;
-              this.best = 0;
-              this.bestLag = 0;
-              this.r1 = 0;
-              this.r2 = 0;
-            }
+            if (++this.stage === LOG2) this.startSearch();
           }
           break;
         }
@@ -442,9 +643,23 @@ export class PeriodicityAnalyzer {
           const floor = 1e-9 * cum[N] + 1e-30;
           const last = this.lagMaxSamples + 1;
           const end = Math.min(last + 1, this.cursor + left);
+          const env = this.envelope;
+          const firstValid = N - this.snapCount;
           for (let tau = this.cursor; tau < end; tau++) {
             const eb = cum[N - tau] - cum[N - W - tau];
-            let r = ea > floor && eb > floor ? re[tau] / (N * Math.sqrt(ea * eb)) : 0;
+            let r = 0;
+            if (ea > floor && eb > floor) {
+              if (env) {
+                // Cauchy–Schwarz bounds the correlation by the share of the window's energy whose lagged
+                // samples exist (all of it once the history is full); the envelope, which mixes in the
+                // neighbouring lags, is held to it (else ~1 at the edge of a history still filling up).
+                const from = Math.max(N - W, firstValid + tau);
+                const share = from < N ? (cum[N] - cum[from]) / ea : 0;
+                r = Math.min(Math.sqrt(re[tau] * re[tau] + im[tau] * im[tau]) / (N * Math.sqrt(ea * eb)), Math.sqrt(share));
+              } else {
+                r = re[tau] / (N * Math.sqrt(ea * eb));
+              }
+            }
             if (r < 0) r = -r;
             // r1 = |ρ(τ−1)|: a local maximum inside [lagMin, lagMax].
             const lag = tau - 1;
@@ -463,6 +678,7 @@ export class PeriodicityAnalyzer {
             this.rhoOut = Math.min(1, this.best);
             this.lagOut = this.bestLag;
             this.age = this.running;
+            this.done++;
             this.phase = P_IDLE;
             return;
           }
@@ -478,7 +694,11 @@ export class PeriodicityAnalyzer {
 /**
  * Runs on the pre-limiter output of one channel. Decimates to ~12 kHz (factor round(fs/12000)) with
  * an anti-alias low-pass, 512-point Hann FFT every 256 decimated samples, and a periodicity analysis
- * (PeriodicityAnalyzer) of the signal at half that rate every 200 ms. Triggers:
+ * (PeriodicityAnalyzer) of the signal every 200 ms: at half the decimated rate (~6 kHz, band ≤ ~2.4 kHz),
+ * or, once setBandHz() reports a chain wider than HOWL_WIDE_BAND_HZ (until it is back at or below
+ * HOWL_NARROW_BAND_HZ), at the decimated rate itself (~12 kHz, band ≤ ~4.8 kHz, 16384 points: the same
+ * lags and window; |ρ| from the correlation's envelope, which a howl at 2.4–4.8 kHz needs on a 1/12 ms lag
+ * grid). Loops of 500–1100 ms are analysed at ~3 kHz in both cases. Triggers:
  *  - 'peak-growth': a level that grows > 10 dB/s faster than the commanded gain for ≥ 300 ms (a run of
  *    short-term slopes above 10 dB/s; least-squares slope over the run > 10 dB/s and ≥ 6 standard
  *    errors), reaching 3 dB above the track's earlier levels (so beating tones do not count), while
@@ -499,7 +719,10 @@ export class PeriodicityAnalyzer {
  *    persistent narrow peak or a periodic signal is driving the limiter it waits (≤ 300 ms) so a howl
  *    is reported as such.
  * holdLevels() makes the level tracks restart after a change of the conditioning filters (their glide
- * changes the level at constant commanded gain). The state latches until reset().
+ * changes the level at constant commanded gain). A change of the main analysis' rate starts it over: no
+ * periodicity until its first analysis of the new rate (~260 ms), and the band-level growth rule waits for
+ * its second one (the 'not falling' test needs a previous analysis of the same signal path). The state
+ * latches until reset(); the rate is a property of the chain and survives it.
  */
 export class HowlDetector {
   private readonly decim: number;
@@ -559,11 +782,18 @@ export class HowlDetector {
   private readonly bbPow = new Float64Array(BB_AVG_FRAMES);
   private bbN = 0;
 
-  // Periodicity at ~6 kHz, and of long loops at ~3 kHz.
+  // Periodicity at ~6 kHz (or ~12 kHz for a wide chain), and of long loops at ~3 kHz.
   private readonly perDec: number;
   private readonly perAa: Biquad[];
   private perPhase = 0;
   private readonly per: PeriodicityAnalyzer;
+  /** The main analysis at the decimated rate (null when that is already the rate of `per`). */
+  private readonly perWide: PeriodicityAnalyzer | null;
+  private wide = false;
+  /** The main analysis in use: `per`, or `perWide` while the chain is wide. */
+  private main: PeriodicityAnalyzer;
+  /** The main analysis' rate changed since the last reset(): band-level growth waits for its 2nd analysis. */
+  private mainSwitched = false;
   private readonly longAa: Biquad[];
   private longPhase = 0;
   private readonly perLong: PeriodicityAnalyzer;
@@ -616,6 +846,9 @@ export class HowlDetector {
     const fp = this.fsd / this.perDec;
     this.perAa = this.perDec > 1 ? PER_AA_Q.map((q) => new Biquad(lowpass(this.fsd, AA_FRACTION * fp, q))) : [];
     this.per = new PeriodicityAnalyzer(fp);
+    this.perWide =
+      this.perDec > 1 ? new PeriodicityAnalyzer(this.fsd, HOWL_PERIODIC_EVERY_MS, { log2N: PER_LOG2 + 1, envelope: true }) : null;
+    this.main = this.per;
     this.longAa = PER_AA_Q.map((q) => new Biquad(lowpass(fp, (AA_FRACTION * fp) / 2, q)));
     this.perLong = new PeriodicityAnalyzer(fp / 2, LONG_EVERY_MS, {
       lagMinMs: LONG_LOOP_MIN_MS,
@@ -649,6 +882,8 @@ export class HowlDetector {
     this.bbN = 0;
     this.perPhase = 0;
     this.per.reset();
+    this.perWide?.reset();
+    this.mainSwitched = false;
     this.longPhase = 0;
     this.perLong.reset();
     this.holdLeft = 0;
@@ -724,17 +959,22 @@ export class HowlDetector {
     }
     this.wpos = (this.wpos + 1) & (HOWL_FFT_SIZE - 1);
     this.decCount++;
+    // The ~6 kHz stream always runs: it feeds the long-loop analysis in both modes.
     let z = y;
     for (let i = 0; i < this.perAa.length; i++) z = this.perAa[i].process(z);
+    const pw = this.perWide;
+    if (this.wide && pw !== null) pw.push(y);
     if (++this.perPhase >= this.perDec) {
       this.perPhase = 0;
-      this.per.push(z);
+      if (!this.wide) this.per.push(z);
       let u = z;
       for (let i = 0; i < this.longAa.length; i++) u = this.longAa[i].process(u);
       if (++this.longPhase >= 2) {
         this.longPhase = 0;
         this.perLong.push(u);
       }
+      this.periodicNow = this.periodic();
+    } else if (this.wide) {
       this.periodicNow = this.periodic();
     }
     if (++this.sinceFrame >= HOP && this.decCount >= HOWL_FFT_SIZE) {
@@ -743,9 +983,9 @@ export class HowlDetector {
     }
   }
 
-  /** |ρ| of the latest periodicity analysis, 0 once it is older than HOWL_PERIODIC_VALID_MS. */
+  /** |ρ| of the latest (main) periodicity analysis, 0 once it is older than HOWL_PERIODIC_VALID_MS. */
   private recentRho(): number {
-    return this.per.ageMs <= HOWL_PERIODIC_VALID_MS ? this.per.rho : 0;
+    return this.main.ageMs <= HOWL_PERIODIC_VALID_MS ? this.main.rho : 0;
   }
 
   /** The latest periodicity analysis (or the latest long-loop one) is recent and found a strongly periodic signal. */
@@ -764,6 +1004,32 @@ export class HowlDetector {
   holdLevels(ms: number): void {
     const n = Math.ceil((Math.max(0, ms) / 1000) * this.fsd);
     if (n > this.holdLeft) this.holdLeft = n;
+  }
+
+  /**
+   * Upper edge of the band the conditioning chain passes, Hz (howlBandHz; Infinity or NaN: unbounded). It
+   * picks the main periodicity analysis' rate: ~12 kHz above HOWL_WIDE_BAND_HZ, ~6 kHz again at or below
+   * HOWL_NARROW_BAND_HZ, unchanged in between. A change of rate drops the main analysis' history and
+   * results (at both rates: each starts over when it is next used) and makes the band-level growth rule
+   * wait for the second analysis at the new rate. For the message handler; push() never changes the rate.
+   */
+  setBandHz(hz: number): void {
+    const pw = this.perWide;
+    if (pw === null) return;
+    const h = Number.isNaN(hz) ? Infinity : hz;
+    const wide = this.wide ? h > HOWL_NARROW_BAND_HZ : h > HOWL_WIDE_BAND_HZ;
+    if (wide === this.wide) return;
+    this.wide = wide;
+    this.main = wide ? pw : this.per;
+    this.per.reset();
+    pw.reset();
+    this.mainSwitched = true;
+    this.periodicNow = this.periodic();
+  }
+
+  /** True while the main periodicity analysis runs at the decimated rate (~12 kHz: a wide chain). */
+  get wideBand(): boolean {
+    return this.wide;
   }
 
   private trigger(reason: HowlReason, freq: number | null): void {
@@ -930,12 +1196,14 @@ export class HowlDetector {
         return;
       }
     }
-    // The latest periodicity analysis covers the growth run, and its periodicity is not falling.
+    // The latest periodicity analysis covers the growth run, and its periodicity is not falling (after a
+    // change of rate: compared with an analysis at the same rate).
     const rho = this.recentRho();
-    const perEnd = (this.decCount * 1000) / this.fsd - this.per.ageMs;
+    const perEnd = (this.decCount * 1000) / this.fsd - this.main.ageMs;
     const periodicGrowth =
       rho >= HOWL_GROWTH_RHO &&
-      rho >= this.per.previousRho - HOWL_GROWTH_RHO_DROP &&
+      (!this.mainSwitched || this.main.analyses >= 2) &&
+      rho >= this.main.previousRho - HOWL_GROWTH_RHO_DROP &&
       perEnd >= this.tGrowStart[BB] + BB_RUN_PERIODIC_MS;
     if (this.tMatched[BB] && periodicGrowth && this.growthDetected(BB, now)) {
       this.trigger('peak-growth', this.peakPresent ? this.peakFreq : this.domFreq);

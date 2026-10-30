@@ -2,11 +2,19 @@
  * The complete real-time anti-phase chain, shared by the AudioWorklet, the unit tests and the closed-loop
  * simulator. Pure TypeScript: no globals, the sample rate is passed in, double precision throughout.
  *
- * Per sample: x = in[refChannel]; x̂ = x − feedback prediction; cond = conditioning(x̂); delay line;
- * per channel: smooth delay tap → [Hilbert rotation] → polarity → channel gain + master (one ramp, so
- * both share the rise limit) → soft-start · mute · bypass · reconfigure · channel soft-start · measurement
- * gate → (+ calibration stimulus × master) → howl detector (pre-limiter) → limiter and final clip →
- * output (exact zeros while not armed).
+ * Per sample: x = in[refChannel]; x̂ = x − feedback prediction; cond = conditioning(x̂) (the neutral chain:
+ * 'cond' tap); per channel: the channel's conditioning (cond, or in tonal mode the bank with the channel's
+ * harmonic trims) → the channel's delay line → smooth delay tap → [Hilbert rotation] → polarity → channel
+ * gain + master (one ramp, so both share the rise limit) → soft-start · mute · bypass · reconfigure ·
+ * channel soft-start · measurement gate → (+ calibration stimulus × master) → howl detector (pre-limiter) →
+ * limiter and final clip → output (exact zeros while not armed).
+ *
+ * Harmonic trims (tonal mode, harmonic-trims.ts) make the two channels' conditioned signals differ, so each
+ * channel has its own delay line, both written every sample (with cond itself when a channel is untrimmed or
+ * not in tonal mode: the outputs are then exactly those of a single shared line). Trim targets are rate-
+ * limited per harmonic by a TrimRamp that shares the channel's gain budget (a harmonic's level, gain + master
+ * + trim, rises by at most BIG_JUMP_DB + MAX_RISE_DB_PER_S·T, waiting while the anti-noise is not heard) and
+ * glided by the bank over COEFF_RAMP_MS, one glide at a time.
  *
  * Rises are never completed unheard: while the bypass or the measurement gate holds the anti-noise at 0
  * (both reopen in 15 ms) gain increases and soft-starts wait, and a channel that is enabled, or whose path
@@ -21,8 +29,9 @@ import { COEFF_RAMP_MS } from './biquad.ts';
 import { FeedbackCanceller } from './feedback-canceller.ts';
 import { DelayLine, SmoothDelayTap } from './fractional-delay.ts';
 import { GainRamp, RISE_FLOOR_DB } from './gain-ramp.ts';
+import { TrimRamp } from './harmonic-trims.ts';
 import { PhaseRotator } from './hilbert-pair.ts';
-import { HowlDetector } from './howl-detector.ts';
+import { HowlDetector, howlBandHz } from './howl-detector.ts';
 import { PeakLimiter } from './limiter.ts';
 import { LevelMeter } from './meters.ts';
 import {
@@ -65,8 +74,9 @@ const MAX_QUEUE = 256;
 /** The 4-tap Lagrange read at delay d reaches back to sample n − ⌊d⌋ − 2. */
 const LAGRANGE_REACH = 3;
 /**
- * Backstop for howls the HowlDetector cannot see (above its ~2.4 kHz periodicity band, ~1.2 kHz for loops
- * of 600–1100 ms; loops longer than 1.1 s): a limiter whose gain reduction, smoothed over
+ * Backstop for howls the HowlDetector cannot see (above its periodicity band: ~2.4 kHz, or ~4.8 kHz for a
+ * chain wider than 2 kHz; ~1.2 kHz for loops of 600–1100 ms; loops longer than 1.1 s): a limiter whose gain
+ * reduction, smoothed over
  * LIMITER_BACKSTOP_TAU_MS, stays above LIMITER_BACKSTOP_DB for LIMITER_BACKSTOP_MS is muted as
  * 'limiter-saturated', whatever the content.
  * GR alone cannot tell a howl from loud noise (broadband noise 6 dB below the ceiling averages ~3 dB of
@@ -193,7 +203,15 @@ export class AntiPhaseEngine {
   private errCh: 0 | 1 | -1;
   private readonly fb: FeedbackCanceller;
   private readonly firPending: [PendingFir | null, PendingFir | null] = [null, null];
-  private readonly line: DelayLine;
+  /** One delay line per channel, written in lockstep (same discontinuities, same cleanFrom). */
+  private readonly lines: [DelayLine, DelayLine];
+  /** Rate limiters of the channels' harmonic trims (sharing gains[ch]'s budget); the chains apply `applied`. */
+  private readonly trimRamps: [TrimRamp, TrimRamp];
+  /** A trim rise, or a deferred hand-over to the live chain, is under way on some channel. */
+  private trimBusy = false;
+  /** Per channel: clock of the last trim hand-over to the live chain, and a newer one waiting for its glide. */
+  private readonly trimPushAt = new Float64Array([-Infinity, -Infinity]);
+  private readonly trimDeferred = new Uint8Array(2);
 
   // Channels.
   private readonly taps: [SmoothDelayTap, SmoothDelayTap];
@@ -319,17 +337,20 @@ export class AntiPhaseEngine {
     this.liveRef = p.refChannel;
     this.errCh = p.errorChannel;
     this.fb = new FeedbackCanceller(fs, Math.round((FEEDBACK_MAX_BULK_MS / 1000) * fs), FEEDBACK_MAX_TAPS);
-    this.line = new DelayLine(delayCapacity(fs));
+    this.lines = [new DelayLine(delayCapacity(fs)), new DelayLine(delayCapacity(fs))];
 
     this.taps = [new SmoothDelayTap(fs), new SmoothDelayTap(fs)];
     this.rot = [new PhaseRotator(fs), new PhaseRotator(fs)];
     this.gains = [new GainRamp(fs, totalGainDb(p, 0)), new GainRamp(fs, totalGainDb(p, 1))];
+    // A harmonic rises with the channel gain (+ master) and its trim: one rise budget for both.
+    this.trimRamps = [new TrimRamp(fs, this.gains[0]), new TrimRamp(fs, this.gains[1])];
     this.gains[0].setRiseFloorDb(p.channels[0].gainDb + RISE_FLOOR_DB);
     this.gains[1].setRiseFloorDb(p.channels[1].gainDb + RISE_FLOOR_DB);
     this.rec = [new LinearEnvelope(fs, 0), new LinearEnvelope(fs, 0)];
     this.chSoft = [new LinearEnvelope(fs, 1), new LinearEnvelope(fs, 1)];
     this.lim = [new PeakLimiter(fs, p.ceilingDb), new PeakLimiter(fs, p.ceilingDb)];
     this.howl = [new HowlDetector(fs), new HowlDetector(fs)];
+    for (const h of this.howl) h.setBandHz(howlBandHz(p));
     this.jumpSamples = (DELAY_JUMP_THRESHOLD_MS / 1000) * fs;
     this.satLimit = Math.round((LIMITER_BACKSTOP_MS / 1000) * fs);
     this.grCoef = 1 - Math.exp(-1000 / (LIMITER_BACKSTOP_TAU_MS * fs));
@@ -427,6 +448,8 @@ export class AntiPhaseEngine {
   private setParams(raw: EngineParams): void {
     const p = clampParams(raw);
     this.target = p;
+    // The detectors' periodicity analysis follows the chain's band (its rate changes only here).
+    for (const h of this.howl) h.setBandHz(howlBandHz(p));
     if (p.errorChannel !== this.errCh) this.mErr.reset();
     this.errCh = p.errorChannel;
     this.computeDelays(p);
@@ -442,6 +465,7 @@ export class AntiPhaseEngine {
     this.setCeiling(p.ceilingDb, false);
 
     let global = false;
+    let standbyNew = false;
     const key = chainKey(p);
     const standby = this.chains[1 - this.live];
     if (this.swapPending && key === this.pendingKey && liveChange(this.pendingChain, p)) {
@@ -460,7 +484,9 @@ export class AntiPhaseEngine {
       this.pendingKey = key;
       this.pendingChain = p;
       global = true;
+      standbyNew = true;
     }
+    this.updateTrims(p, standbyNew);
     if (p.refChannel !== this.liveRef) global = true;
     if (global) this.pendingGlobal = true;
 
@@ -474,6 +500,65 @@ export class AntiPhaseEngine {
       if (structural) this.markPending(ch);
       else if (this.pendingCh[ch] === 0) this.applyDelay(ch);
     }
+  }
+
+  /**
+   * New trim targets (running output): the TrimRamps decide what applies now; the live chain glides to it,
+   * a standby chain (silent until the swap) takes it at once. A newly configured standby chain gets the
+   * applied trims even when they did not change.
+   */
+  private updateTrims(p: EngineParams, standbyNew: boolean): void {
+    for (let ch = 0; ch < 2; ch++) {
+      const r = this.trimRamps[ch];
+      if (r.setTarget(p.channels[ch].harmonicTrims, this.clock, this.closed)) this.pushTrims(ch as 0 | 1);
+      else if (standbyNew) this.chains[1 - this.live].setTrims(ch as 0 | 1, r.applied, 0);
+    }
+    this.updateTrimBusy();
+  }
+
+  /**
+   * Hands a channel's applied trims to the chains: the standby at once; the live chain with a COEFF_RAMP_MS
+   * glide, at most one per glide. A newer value that arrives while the live glide runs (a dragged trim
+   * control sends one every few ms) waits for its end, so the weights move in whole back-to-back glides
+   * (smootherstep joins: zero slope) instead of restarting mid-glide from a point in motion.
+   * A hand-over that raises a harmonic faster than the MAX_RISE_DB_PER_S staircase (a fast rise from the
+   * budget: a dragged trim gain, up to BIG_JUMP_DB) changes that channel's response at constant commanded
+   * gain, as a live filter change does: its howl detector restarts its level tracks (holdLevels), or a drag
+   * of a few dB over a few hundred ms would read as a 'peak-growth' run. The staircase itself (≤ 6 dB/s) does
+   * not, so a howl the trims close while rising is still seen.
+   */
+  private pushTrims(ch: 0 | 1): void {
+    const r = this.trimRamps[ch];
+    const t = r.applied;
+    if (this.swapPending) this.chains[1 - this.live].setTrims(ch, t, 0);
+    const since = this.clock - this.trimPushAt[ch];
+    if (since < r.stepSamples) {
+      this.trimDeferred[ch] = 1;
+      return;
+    }
+    this.chains[this.live].setTrims(ch, t);
+    if (r.riseSinceMark() > (MAX_RISE_DB_PER_S * since) / this.fs + 1e-9) this.howl[ch].holdLevels(LIVE_HOLD_MS);
+    r.setMark();
+    this.trimPushAt[ch] = this.clock;
+    this.trimDeferred[ch] = 0;
+  }
+
+  private updateTrimBusy(): void {
+    const [a, b] = this.trimRamps;
+    this.trimBusy = a.pending || b.pending || this.trimDeferred[0] === 1 || this.trimDeferred[1] === 1;
+  }
+
+  /**
+   * A trim rise in progress: one step (≤ 0.12 dB, glided by the bank) every COEFF_RAMP_MS; a deferred
+   * hand-over once the live glide has ended.
+   */
+  private stepTrims(): void {
+    for (let ch = 0; ch < 2; ch++) {
+      const r = this.trimRamps[ch];
+      if (r.due(this.clock) && r.step(this.clock, this.closed)) this.pushTrims(ch as 0 | 1);
+      else if (this.trimDeferred[ch] === 1 && this.clock - this.trimPushAt[ch] >= r.stepSamples) this.pushTrims(ch as 0 | 1);
+    }
+    this.updateTrimBusy();
   }
 
   /**
@@ -604,7 +689,13 @@ export class AntiPhaseEngine {
       // Arming soft-starts every channel anyway.
       this.chSoft[ch].set(1);
       this.setGain(ch, p, true);
+      const r = this.trimRamps[ch];
+      r.jump(p.channels[ch].harmonicTrims, this.clock);
+      this.chains[this.live].setTrims(ch as 0 | 1, r.applied, 0);
+      this.trimPushAt[ch] = -Infinity;
+      this.trimDeferred[ch] = 0;
     }
+    this.trimBusy = false;
     this.master.jumpTo(p.masterDb);
     this.setCeiling(p.ceilingDb, true);
     this.pendingGlobal = false;
@@ -875,21 +966,36 @@ export class AntiPhaseEngine {
         // While the bypass or the measurement gate is shut, rises (soft-starts, gain increases) wait.
         const closed = this.bypassEnv.value === 0 || this.gate.value === 0;
         this.closed = closed;
+        if (this.trimBusy) this.stepTrims();
         const soft = closed && this.soft.target > this.soft.value ? this.soft.value : this.soft.next();
         const common = soft * this.muteEnv.next() * this.bypassEnv.next() * this.gate.next();
         const master = this.master.next();
 
         const xh = x - this.fb.predict();
         let cond = xh;
+        let c0 = xh;
+        let c1 = xh;
         if (!this.bypassCond) {
-          cond = this.chains[this.live].process(xh);
+          const chain = this.chains[this.live];
+          cond = chain.process(xh);
+          c0 = chain.channelOut[0];
+          c1 = chain.channelOut[1];
           if (this.swapPending) this.chains[1 - this.live].process(xh);
         }
         if (!Number.isFinite(cond)) {
           cond = 0;
           this.bad = true;
         }
-        this.line.write(cond);
+        if (!Number.isFinite(c0)) {
+          c0 = 0;
+          this.bad = true;
+        }
+        if (!Number.isFinite(c1)) {
+          c1 = 0;
+          this.bad = true;
+        }
+        this.lines[0].write(c0);
+        this.lines[1].write(c1);
 
         const st = this.measState;
         let stim = 0;
@@ -957,7 +1063,7 @@ export class AntiPhaseEngine {
   }
 
   private channelSample(ch: 0 | 1, common: number, master: number, stim: number, howlOn: boolean): number {
-    let v = this.taps[ch].next(this.line);
+    let v = this.taps[ch].next(this.lines[ch]);
     // The rotators always run so that switching to Hilbert mode finds them settled.
     const r = this.rot[ch].process(v);
     if (this.useRot[ch] === 1) v = r;
@@ -1016,7 +1122,8 @@ export class AntiPhaseEngine {
     this.bad = false;
     this.chains[0].reset();
     this.chains[1].reset();
-    this.line.reset();
+    this.lines[0].reset();
+    this.lines[1].reset();
     this.rot[0].reset();
     this.rot[1].reset();
     this.lim[0].reset();
@@ -1086,6 +1193,7 @@ export class AntiPhaseEngine {
       blockSize: this.blockSize,
       ch2: this.ch2Status,
       measuring: this.measState !== M_IDLE,
+      masterDb: Math.max(MASTER_MIN_DB, this.master.currentDb),
     });
   }
 

@@ -7,8 +7,24 @@ import { fileURLToPath } from 'node:url';
 import type { E2eHooks } from '../src/app/e2e-hooks.ts';
 
 export const FIXTURE_FS = 48000;
-export const FIXTURES = ['tone-200hz', 'noise'] as const;
+export const FIXTURES = ['tone-200hz', 'noise', 'harmonic-100hz'] as const;
 export type FixtureName = (typeof FIXTURES)[number];
+
+/** The spec each fixture's project runs (anc.spec.ts keeps its two fixtures, trims.spec.ts gets its own). */
+export const FIXTURE_SPECS: Record<FixtureName, string> = {
+  'tone-200hz': 'anc.spec.ts',
+  noise: 'anc.spec.ts',
+  'harmonic-100hz': 'trims.spec.ts',
+};
+
+/** harmonic-100hz.wav: fundamental and the relative amplitude / phase (degrees, sine) of harmonics 1…4. */
+export const HARMONIC_F0 = 100;
+export const HARMONIC_PARTIALS: ReadonlyArray<{ amp: number; phaseDeg: number }> = [
+  { amp: 1, phaseDeg: 0 },
+  { amp: 0.6, phaseDeg: 45 },
+  { amp: 0.4, phaseDeg: 110 },
+  { amp: 0.3, phaseDeg: 250 },
+];
 
 export const fixturePath = (name: FixtureName): string =>
   fileURLToPath(new URL(`./fixtures/${name}.wav`, import.meta.url));
@@ -165,3 +181,54 @@ export function silenceAfterEscape(blocks: readonly RecordedBlock[], tEsc: numbe
   }
   return { escSample, lastLoud, total: idx, peakBefore };
 }
+
+// ------------------------------------------------------------------------------ lock-in (harmonic-100hz)
+
+export interface Phasor {
+  re: number;
+  im: number;
+}
+
+/**
+ * Complex amplitude of x at f over x[start … start + n): (2/n)·Σ x[k]·e^{−j2πf(k − start)/fs}. Every channel
+ * analysed on the same window shares the time origin, so ratios between channels are transfer functions. Over a
+ * whole number of periods of f0 the other harmonics of f0 cancel exactly (wholePeriods).
+ */
+export function lockIn(x: ArrayLike<number>, f: number, fs: number, start: number, n: number): Phasor {
+  const w = (2 * Math.PI * f) / fs;
+  let re = 0;
+  let im = 0;
+  for (let k = 0; k < n; k++) {
+    const v = x[start + k] as number;
+    re += v * Math.cos(w * k);
+    im -= v * Math.sin(w * k);
+  }
+  return { re: (2 * re) / n, im: (2 * im) / n };
+}
+
+/** The last whole number of periods of f0 in `frames` samples (fs/f0 must be an integer number of samples). */
+export function wholePeriods(frames: number, fs: number, f0: number): { start: number; n: number } {
+  const period = fs / f0;
+  if (!Number.isInteger(period)) throw new Error(`${fs} Hz / ${f0} Hz is not a whole number of samples`);
+  const n = Math.floor(frames / period) * period;
+  return { start: frames - n, n };
+}
+
+export const divide = (a: Phasor, b: Phasor): Phasor => {
+  const d = b.re * b.re + b.im * b.im;
+  return { re: (a.re * b.re + a.im * b.im) / d, im: (a.im * b.re - a.re * b.im) / d };
+};
+
+export const magnitudeDb = (z: Phasor): number => 20 * Math.log10(Math.hypot(z.re, z.im));
+
+/** An angle in degrees wrapped into (−180, 180]. */
+export const wrapDeg = (d: number): number => d - 360 * Math.ceil((d - 180) / 360);
+
+/**
+ * A complex ratio as a harmonic trim: gain in dB and phase LAG in degrees (−arg, wrapped), the convention of
+ * HarmonicTrim (factor 10^(gainDb/20)·e^{−j·phaseDeg·π/180}).
+ */
+export const asTrim = (z: Phasor): { gainDb: number; phaseDeg: number } => ({
+  gainDb: magnitudeDb(z),
+  phaseDeg: wrapDeg((-Math.atan2(z.im, z.re) * 180) / Math.PI),
+});

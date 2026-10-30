@@ -2,8 +2,11 @@
  * Closed-loop rig: the real AntiPhaseEngine around the simulated plant, driven block by block, with the
  * MeasureFn / CaptureFn / AutotuneDriver the browser gets from the worklet — so the calibration and
  * autotune code runs unmodified against the simulator. Everything is synchronous underneath; the async
- * functions resolve once the simulated audio has run.
+ * functions resolve once the simulated audio has run. SimEngine puts a whole AppController on the rig.
  */
+import type { EngineLike } from '../../src/app/controller.ts';
+import type { AudioEngineEvent, AudioStats, MeasureResult, TrackInfo } from '../../src/audio/audio-engine.ts';
+import { harmonicLevelsDb } from '../../src/audio/autotune.ts';
 import type { AutotuneDriver } from '../../src/audio/autotune.ts';
 import type { CaptureFn, MeasureFn } from '../../src/audio/calibration.ts';
 import type { WorkletInMsg, WorkletOutMsg } from '../../src/audio/protocol.ts';
@@ -77,6 +80,7 @@ export class SimRig {
   maxAbsOut = 0;
   private readonly errorMic: boolean;
   private readonly onMessage: ((msg: WorkletOutMsg) => void) | null;
+  private readonly listeners = new Set<(msg: WorkletOutMsg) => void>();
   private readonly outL: Float32Array;
   private readonly outR: Float32Array;
   private measureId = 0;
@@ -105,6 +109,19 @@ export class SimRig {
     return clampParams(this.params);
   }
 
+  /** Simulated time so far, s. */
+  get timeS(): number {
+    return this.plant.elapsedSamples / this.fs;
+  }
+
+  /** Like RigOptions.onMessage, added later (SimEngine); returns the unsubscribe function. */
+  listen(cb: (msg: WorkletOutMsg) => void): () => void {
+    this.listeners.add(cb);
+    return () => {
+      this.listeners.delete(cb);
+    };
+  }
+
   /** One block of closed-loop audio. */
   private step(rec?: Map<Signal, Float32Array>, offset = 0): void {
     const { ref, err } = this.plant.next();
@@ -128,6 +145,7 @@ export class SimRig {
     }
     this.engine.drain((msg) => {
       if (this.onMessage !== null) this.onMessage(msg);
+      for (const cb of [...this.listeners]) cb(msg);
       if (msg.type === 'meters' || msg.type === 'measureProgress') return;
       if (msg.type === 'tap') {
         this.engine.handleMessage({ type: 'recycle', buffer: msg.block });
@@ -210,12 +228,25 @@ export class SimRig {
     return { ref: r.ref!, err: this.errorMic ? r.err! : null };
   };
 
-  /** AutotuneDriver on the simulator, logging every measurement and apply. */
+  /** AutotuneDriver on the simulator (band levels, and per-harmonic levels for the tonal search), logging every measurement and apply. */
   autotuneDriver(
     band: [number, number],
     signal?: AbortSignal,
-  ): AutotuneDriver & { log: { errors: number[]; bypass: number[]; applied: { p: EngineParams; jump: boolean }[] } } {
-    const log = { errors: [] as number[], bypass: [] as number[], applied: [] as { p: EngineParams; jump: boolean }[] };
+  ): AutotuneDriver & {
+    log: {
+      errors: number[];
+      bypass: number[];
+      applied: { p: EngineParams; jump: boolean }[];
+      harmonics: { bypass: boolean; levels: number[]; t: number }[];
+    };
+  } {
+    const log = {
+      errors: [] as number[],
+      bypass: [] as number[],
+      applied: [] as { p: EngineParams; jump: boolean }[],
+      /** Every per-harmonic window, in order, with its centre (simulated time, s). */
+      harmonics: [] as { bypass: boolean; levels: number[]; t: number }[],
+    };
     return {
       log,
       signal,
@@ -236,6 +267,101 @@ export class SimRig {
         log.bypass.push(db);
         return db;
       },
+      // Tonal search: synchronous detection of each harmonic; the logs get the power sum (the tonal level).
+      measureHarmonicsDb: async (ms, freqs, bypass, tolHz) => {
+        let t = 0;
+        const rec = (): Float32Array => {
+          t = this.timeS + ms / 2000;
+          return this.run(ms / 1000, ['err']).err!;
+        };
+        const levels = harmonicLevelsDb(bypass ? this.bypassed(rec) : rec(), this.fs, freqs, tolHz);
+        const total = 10 * Math.log10(levels.reduce((a, db) => a + Math.pow(10, db / 10), 0));
+        (bypass ? log.bypass : log.errors).push(total);
+        log.harmonics.push({ bypass, levels: [...levels], t });
+        return levels;
+      },
+    };
+  }
+}
+
+/**
+ * The rig as an AppController's audio engine (EngineLike), so the controller runs unmodified on the simulator:
+ * messages go to the engine, everything the engine posts (taps and meters included) comes back as engine
+ * events. Nothing runs by itself: the test advances the rig and the (fake) timers together.
+ */
+export class SimEngine implements EngineLike {
+  state: 'idle' | 'mic' | 'error' = 'idle';
+  readonly error: string | null = null;
+  readonly sinkSupported = true;
+  stats: AudioStats;
+  trackInfo: TrackInfo | null = null;
+  /** Every message the controller sent, with the simulated time (s). */
+  readonly sent: { t: number; msg: WorkletInMsg }[] = [];
+  private readonly listeners = new Set<(e: AudioEngineEvent) => void>();
+  private readonly settings: MediaTrackSettings;
+
+  constructor(readonly rig: SimRig) {
+    this.settings = {
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: false,
+      sampleRate: rig.fs,
+      channelCount: 2,
+      deviceId: 'sim-in',
+    };
+    this.stats = { ...this.statsOpen(), sampleRate: 0, trackSettings: null };
+    rig.listen((msg) => {
+      for (const cb of [...this.listeners]) cb(msg);
+    });
+  }
+
+  private statsOpen(): AudioStats {
+    return {
+      sampleRate: this.rig.fs,
+      renderQuantum: this.rig.block,
+      baseLatencyMs: 2.7,
+      outputLatencyMs: 12,
+      trackLatencyMs: 5,
+      underruns: 0,
+      trackSettings: this.settings,
+      sinkId: '',
+    };
+  }
+
+  async openMic(): Promise<void> {
+    this.state = 'mic';
+    this.stats = this.statsOpen();
+    this.trackInfo = { deviceId: 'sim-in', groupId: 'sim', label: 'Interfaccia simulata', settings: this.settings, channelCount: 2 };
+  }
+
+  async setOutput(): Promise<void> {}
+
+  async ensureContextMatchesTrack(): Promise<boolean> {
+    return false;
+  }
+
+  async setLatencyMode(): Promise<void> {}
+
+  send(msg: WorkletInMsg): void {
+    this.sent.push({ t: this.rig.timeS, msg });
+    this.rig.send(msg);
+  }
+
+  /** Runs the simulated audio itself (synchronously): not for use while the test drives the timers. */
+  measure(stimulus: Float32Array, channel: 0 | 1, postRollFrames: number): Promise<MeasureResult> {
+    return this.rig.measure(stimulus, channel, postRollFrames);
+  }
+
+  panic(): void {
+    this.send({ type: 'panic' });
+  }
+
+  async resume(): Promise<void> {}
+
+  on(cb: (e: AudioEngineEvent) => void): () => void {
+    this.listeners.add(cb);
+    return () => {
+      this.listeners.delete(cb);
     };
   }
 }

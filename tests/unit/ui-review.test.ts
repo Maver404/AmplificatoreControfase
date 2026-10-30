@@ -184,6 +184,7 @@ describe('live regions are not rewritten with the same text (ui-8)', () => {
       blockSize: 128,
       ch2: 'absent' as const,
       measuring: false,
+      masterDb: -30,
     };
     const info = { fs: 48000, speedOfSound: 343, phaseRefHz: 100, calibrated: null, phaseMode: 'delay' as const, gainUnlocked: false, linked: false };
     strip.update(p.channels[0], meters, info);

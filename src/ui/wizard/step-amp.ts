@@ -3,46 +3,55 @@
  * at the output, through master and limiter) plays on one channel; the user raises the amplifier
  * until, in the zone, it is about as loud as the noise to cancel (never above 85 dBA). Stop button
  * and Esc (PANIC) stop it. Required before any un-mute, for every channel that will be used.
- * The master is brought to 0 dB on entering, and the noise can start only once the engine's
- * rate-limited master (6 dB/s) has got there: otherwise the noise would start up to tens of dB
- * quieter and keep growing while the user sets the amplifier. Reusing a saved calibration, the
- * saved master comes back when leaving the step.
+ * The master is brought to 0 dB on entering, and the noise starts only once the engine reports
+ * (MeterSnapshot.masterDb) that its rate-limited master (6 dB/s) is within 0.1 dB of it: the user sets
+ * the amplifier against the final level from the first second. If the meters never confirm it
+ * (masterWaitTimeoutMs) the noise does not start and the step says why. Reusing a saved calibration,
+ * the saved master comes back when leaving the step.
  */
 import type { ControllerState } from '../../app/controller.ts';
 import { defaultSweepBand } from '../../audio/calibration.ts';
 import { formatNumber } from '../units.ts';
-import { button, checkbox, el, liveNote, note, progressBar, radioCards, setText, sleep } from './dom.ts';
+import { button, checkbox, el, liveNote, note, progressBar, radioCards, setText } from './dom.ts';
 import type { StepEnv, StepView } from './env.ts';
 import { ampKey, ampLeveledOk, amplifierReleveled } from './flow.ts';
-import { AMP_STEP_MASTER_DB, CH_NAME, refLevelAdvice, stimulusLevels } from './logic.ts';
-import { NOISE_MAX_S, playLevelNoise } from './ops.ts';
+import {
+  AMP_STEP_MASTER_DB,
+  CH_NAME,
+  liveMasterDb,
+  masterReached,
+  masterWaitTimeoutMs,
+  refLevelAdvice,
+  stimulusLevels,
+} from './logic.ts';
+import { NOISE_MAX_S, playLevelNoise, waitForState } from './ops.ts';
 
 /** Noise heard for at least this long before the level can be confirmed. */
 const MIN_LISTEN_S = 3;
+
+/** The live master never reached the step's level (meters missing, or the engine not following). */
+export function masterTimeoutText(timeoutMs: number): string {
+  return (
+    `Il volume master non è arrivato a 0 dB entro ${formatNumber(Math.ceil(timeoutMs / 1000), 0)} s: il rumore di prova non è partito. ` +
+    'Controlla che l’audio sia attivo (gli indicatori di livello si muovono) e premi di nuovo «Fai suonare il rumore di prova».'
+  );
+}
+
+/** The live master has reached the step's level. */
+const masterAtStep = (s: ControllerState): boolean => masterReached(liveMasterDb(s), AMP_STEP_MASTER_DB);
 
 export function createAmpStep(env: StepEnv): StepView {
   const { controller, data } = env;
   let channel: 0 | 1 = 0;
   let playing: 0 | 1 | null = null;
   let playErr: string | null = null;
-  /** Waiting for the master ramp before the noise starts. */
+  /** Waiting for the live master before the noise starts. */
   let preparing = false;
-  let readyTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** Brings the master to the step's level (silent: the anti-noise is muted, no stimulus plays yet). */
   function raiseMaster(s: ControllerState): void {
     if (!s.armed || s.panic || s.params.masterDb === AMP_STEP_MASTER_DB) return;
     controller.setMaster(AMP_STEP_MASTER_DB);
-    const ms = env.masterReadyInMs();
-    if (readyTimer !== null) clearTimeout(readyTimer);
-    readyTimer = null;
-    // Re-render when the ramp is done (meters may not be flowing).
-    if (ms > 0) {
-      readyTimer = setTimeout(() => {
-        readyTimer = null;
-        env.refresh();
-      }, ms + 50);
-    }
   }
 
   const checks = [
@@ -111,12 +120,19 @@ export function createAmpStep(env: StepEnv): StepView {
     amplifierReleveled(data, ch);
     env.refresh();
     try {
-      // The level the user sets the amplifier against must be the final one from the first second.
-      const wait = env.masterReadyInMs();
-      if (wait > 0) {
+      // The level the user sets the amplifier against must be the final one from the first second:
+      // wait until the engine's meters report the master there (or the target is changed meanwhile).
+      if (!masterAtStep(controller.state)) {
         preparing = true;
         env.refresh();
-        await sleep(wait, op.signal);
+        const timeoutMs = masterWaitTimeoutMs(liveMasterDb(controller.state), AMP_STEP_MASTER_DB);
+        try {
+          await waitForState(controller, (st) => masterAtStep(st) || st.params.masterDb !== AMP_STEP_MASTER_DB, timeoutMs, op.signal);
+        } catch (e) {
+          if (op.signal.aborted) throw e;
+          playErr = masterTimeoutText(timeoutMs);
+          return;
+        }
         preparing = false;
       }
       if (controller.state.params.masterDb !== AMP_STEP_MASTER_DB) {
@@ -165,7 +181,7 @@ export function createAmpStep(env: StepEnv): StepView {
       'info',
       'Mentre suona: vai nella zona da silenziare e alza lentamente l’amplificatore finché il rumore di prova si sente circa forte quanto il rumore da cancellare. ' +
         'Se hai un fonometro non superare 85 dBA. Poi premi Stop. Il volume master dell’app viene portato a 0 dB (sale di 6 dB al secondo: il rumore parte ' +
-        'quando è arrivato): da qui in poi il livello lo decide l’amplificatore.',
+        'quando il motore audio conferma che è arrivato): da qui in poi il livello lo decide l’amplificatore.',
     ),
     reuseNote,
     el('div', 'wz-checklist', ...leveled.map((c) => c.root)),
@@ -194,10 +210,12 @@ export function createAmpStep(env: StepEnv): StepView {
 
       const ready = data.amp.checklist.every(Boolean) && s.armed && !s.panic && s.fs !== null;
       const busy = env.busy !== null;
-      const waitMs = env.masterReadyInMs();
+      // Still rising according to the engine (without meters nothing is known: «Fai suonare» waits and says so).
+      const live = liveMasterDb(s);
+      const rising = s.armed && !s.panic && live !== null && !masterReached(live, AMP_STEP_MASTER_DB);
       chChoice.set(channel === 1 ? '1' : '0');
       chChoice.disable(busy);
-      playBtn.disabled = !ready || busy || waitMs > 0;
+      playBtn.disabled = !ready || busy;
       stopBtn.disabled = playing === null;
       const t = playing !== null ? data.amp.playedS[playing] : 0;
       progress.set(
@@ -205,11 +223,14 @@ export function createAmpStep(env: StepEnv): StepView {
         t / NOISE_MAX_S,
         playing !== null ? `Canale ${CH_NAME[playing]}: ${formatNumber(t, 0)} s (si ferma da solo dopo ${NOISE_MAX_S / 60} min)` : '',
       );
-      const waitText = `Il volume master sta salendo a 0 dB: il rumore di prova parte tra ${formatNumber(Math.ceil(waitMs / 1000), 0)} s.`;
+      // A live region: no dB figure that changes at meter rate.
+      const waitText = preparing
+        ? 'Il volume master sta salendo a 0 dB (6 dB al secondo): il rumore di prova parte appena il motore audio conferma che è arrivato.'
+        : 'Il volume master sta salendo a 0 dB (6 dB al secondo): se premi «Fai suonare il rumore di prova» ora, il rumore parte appena è arrivato.';
       if (playErr) playNote.set('error', playErr);
       else if (!data.amp.checklist.every(Boolean)) playNote.set('info', 'Spunta prima la lista di sicurezza.');
       else if (!s.armed || s.panic) playNote.set('warn', 'L’uscita non è abilitata: torna al passo 1 o riprendi dopo il PANIC.');
-      else if (preparing || (playing === null && waitMs > 0)) playNote.set('info', waitText);
+      else if (preparing || (playing === null && rising)) playNote.set('info', waitText);
       else if (playing !== null) playNote.set('warn', 'Rumore di prova in corso: Stop o Esc per fermarlo.');
       else playNote.clear();
 
@@ -230,8 +251,6 @@ export function createAmpStep(env: StepEnv): StepView {
     },
     leave() {
       if (playing !== null) env.abortOp();
-      if (readyTimer !== null) clearTimeout(readyTimer);
-      readyTimer = null;
       // Reusing a saved calibration: its master volume is part of the saved anti-noise level.
       const r = data.mode === 'reuse' ? data.reuse : null;
       if (r !== null && controller.state.params.masterDb !== r.masterDb) controller.setMaster(r.masterDb);

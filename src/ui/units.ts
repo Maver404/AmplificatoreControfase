@@ -2,6 +2,7 @@
  * Pure helpers for the UI controls: stepping, unit conversion, slider mapping, parsing and
  * Italian number formatting. No DOM access, so everything here is unit-testable in Node.
  */
+import { MAX_HARMONICS } from '../dsp/params.ts';
 
 export interface UnitOption {
   id: string;
@@ -265,6 +266,31 @@ export function totalPhaseDeg(polarityInvert: boolean, deltaDeg: number): number
   const t = (polarityInvert ? 180 : 0) + d;
   const w = ((t % 360) + 360) % 360;
   return cleanFloat(w) === 360 ? 0 : cleanFloat(w);
+}
+
+/**
+ * Total phase at harmonic h·f0 in tonal mode: polarity + h·Δ (Δ is a delay, wrapped on the period)
+ * + the harmonic's trim θ_h, wrapped to [0, 360) like totalPhaseDeg (which is the case h = 1, θ = 0).
+ */
+export function harmonicTotalPhaseDeg(polarityInvert: boolean, deltaDeg: number, harmonic: number, trimPhaseDeg: number): number {
+  const h = Number.isFinite(harmonic) ? Math.max(1, Math.round(harmonic)) : 1;
+  const d = Number.isFinite(deltaDeg) ? deltaDeg : 0;
+  const t = Number.isFinite(trimPhaseDeg) ? trimPhaseDeg : 0;
+  // Wrap h·Δ first: a large product loses no precision against the 360° period.
+  return totalPhaseDeg(polarityInvert, ((h * d) % 360) + t);
+}
+
+/** The resonator bank skips harmonics at or above this fraction of fs (resonator-bank.ts): no output, trims ignored. */
+export const BANK_MAX_FRACTION = 0.45;
+
+/** Harmonics the tonal resonator bank generates: 1..harmonics (≤ MAX_HARMONICS) with h·f0 below 0.45·fs. */
+export function bankHarmonics(harmonics: number, f0: number, fs: number): number[] {
+  if (!(f0 > 0)) return [];
+  const n = Math.min(MAX_HARMONICS, Math.max(1, Number.isFinite(harmonics) ? Math.round(harmonics) : 1));
+  const limit = BANK_MAX_FRACTION * (fs > 0 ? fs : 48000);
+  const out: number[] = [];
+  for (let h = 1; h <= n; h++) if (h * f0 < limit) out.push(h);
+  return out;
 }
 
 /** Time equivalent of a phase offset Δ at frequency f, in milliseconds (positive = lag). */

@@ -26,6 +26,10 @@ export const RISE_FLOOR_DB = -60;
  * MAX_RISE_DB_PER_S, so a series of small steps (e.g. +5 dB every 100 ms) cannot rise faster than
  * MAX_RISE_DB_PER_S on average: over any interval T the gain rises above the floor by at most
  * BIG_JUMP_DB + MAX_RISE_DB_PER_S·T.
+ *
+ * Joint budget: a TrimRamp (harmonic-trims.ts) raises single harmonics of this gain's output, so a
+ * harmonic rises with the gain AND its trim. It shares this budget (budgetDb, takeBudgetPeak,
+ * spendBudgetTo): a trim rise lowers it, so gain + trim at a harmonic obey the same rule.
  */
 export class GainRamp {
   private readonly a: number;
@@ -34,6 +38,8 @@ export class GainRamp {
   private tgt: number;
   /** Remaining fast-rise budget in dB, within [0, BIG_JUMP_DB]. */
   private budget = BIG_JUMP_DB;
+  /** Highest budget (after a sample's refill) since the last takeBudgetPeak(). */
+  private peak = BIG_JUMP_DB;
   private floor = RISE_FLOOR_DB;
   private linDb = Number.NaN;
   private lin = 0;
@@ -71,6 +77,32 @@ export class GainRamp {
     this.cur = d;
     this.tgt = d;
     this.budget = BIG_JUMP_DB;
+    this.peak = BIG_JUMP_DB;
+  }
+
+  /** Remaining fast-rise budget, dB (0 … BIG_JUMP_DB). */
+  get budgetDb(): number {
+    return this.budget;
+  }
+
+  /**
+   * For a rise limiter of part of this gain's output that shares its budget (harmonic-trims.ts TrimRamp):
+   * the highest budget since the previous call, each sample's refill included; the record then restarts
+   * from the current budget.
+   */
+  takeBudgetPeak(): number {
+    const p = this.peak > this.budget ? this.peak : this.budget;
+    this.peak = this.budget;
+    return p;
+  }
+
+  /**
+   * Lowers the budget to `db` (a rise of part of the output spent it: that part rises with this gain too)
+   * and restarts the peak record. Never raises it.
+   */
+  spendBudgetTo(db: number): void {
+    if (db < this.budget) this.budget = db > 0 ? db : 0;
+    this.peak = this.budget;
   }
 
   /**
@@ -81,6 +113,7 @@ export class GainRamp {
   next(holdRise = false): number {
     let budget = this.budget + this.risePerSample;
     if (budget > BIG_JUMP_DB) budget = BIG_JUMP_DB;
+    if (budget > this.peak) this.peak = budget;
     const gap = this.tgt - this.cur;
     if (gap > 0 && holdRise) {
       // Increase deferred until the gain is audible again.

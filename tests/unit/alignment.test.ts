@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  harmonicFactors,
   loopGainDb,
   residualDb,
   sampleResponse,
@@ -10,6 +11,7 @@ import {
 import { biquadResponse, lowpass } from '../../src/dsp/biquad.ts';
 import type { Complex } from '../../src/dsp/complex.ts';
 import { D_MIN_SAMPLES } from '../../src/dsp/params.ts';
+import { mulberry32 } from '../../src/dsp/sweep.ts';
 
 const fs = 48000;
 /** 10 … 1000 Hz in 1 Hz steps. */
@@ -227,5 +229,89 @@ describe('loopGainDb', () => {
     expect(r.atHz).toBe(300);
     expect(r.maxDb).toBeCloseTo(20 * Math.log10(2), 9);
     expect(loopGainDb([g(1), g(1)], [null, null], [20, 500]).maxDb).toBe(-Infinity);
+  });
+});
+
+describe('harmonicFactors (tonal trims of one harmonic)', () => {
+  const c = (re: number, im: number): Complex => ({ re, im });
+  const mul = (a: Complex, b: Complex): Complex => ({ re: a.re * b.re - a.im * b.im, im: a.re * b.im + a.im * b.re });
+  const add = (...v: Complex[]): Complex => v.reduce((s, x) => ({ re: s.re + x.re, im: s.im + x.im }), c(0, 0));
+  const abs = (a: Complex): number => Math.hypot(a.re, a.im);
+  const WIDE = { min: 0, max: Infinity };
+  const TRIM = { min: Math.pow(10, -30 / 20), max: Math.pow(10, 6 / 20) };
+
+  it("one speaker: T = −p/b exactly; outside the bounds the magnitude is clamped, the phase kept", () => {
+    const p = c(0.3, -0.4);
+    const b = c(-0.2, 0.25);
+    const r = harmonicFactors(p, [b, null], 'single', WIDE);
+    expect(abs(add(p, mul(r.t[0]!, b)))).toBeLessThan(1e-15);
+    expect(r.t[1]).toBeNull();
+    expect(r.capped).toEqual([false, false]);
+    // |T| = 0.5/0.32 = 1.56 > 2 dB: clamped to 2 dB with the same phase.
+    const k = harmonicFactors(p, [b, null], 'single', { min: 0.1, max: Math.pow(10, 2 / 20) });
+    expect(k.capped[0]).toBe(true);
+    expect(abs(k.t[0]!)).toBeCloseTo(Math.pow(10, 2 / 20), 12);
+    expect(Math.atan2(k.t[0]!.im, k.t[0]!.re)).toBeCloseTo(Math.atan2(r.t[0]!.im, r.t[0]!.re), 12);
+    // 'single' ignores channel 1; a channel that does not reach the harmonic gets no factor.
+    expect(harmonicFactors(p, [b, b], 'single', WIDE).t[1]).toBeNull();
+    expect(harmonicFactors(p, [c(0, 0), null], 'single', WIDE).t[0]).toBeNull();
+  });
+
+  it("'separate': each speaker against p alone (its own zone)", () => {
+    const p = c(0.3, -0.4);
+    const b: [Complex, Complex] = [c(-0.2, 0.25), c(0.1, 0.5)];
+    const r = harmonicFactors(p, b, 'separate', WIDE);
+    for (const ch of [0, 1] as const) expect(abs(add(p, mul(r.t[ch]!, b[ch])))).toBeLessThan(1e-15);
+  });
+
+  it("'shared': the minimum change Σ|T − 1|² that nulls the residual (an exact broadband split stays 1)", () => {
+    const p = c(0.3, -0.4);
+    const b: [Complex, Complex] = [c(-0.2, 0.25), c(-0.05, 0.1)];
+    const r = harmonicFactors(p, b, 'shared', WIDE);
+    const t0 = r.t[0]!;
+    const t1 = r.t[1]!;
+    expect(abs(add(p, mul(t0, b[0]), mul(t1, b[1])))).toBeLessThan(1e-15);
+    const norm = (a: Complex, d: Complex): number => abs(add(a, c(-1, 0))) ** 2 + abs(add(d, c(-1, 0))) ** 2;
+    // Every other null moves along (b1, −b0)·ε and is farther from (1, 1).
+    for (const e of [c(0.01, 0), c(0, 0.01), c(-0.2, 0.1)]) {
+      const a = add(t0, mul(e, b[1]));
+      const d = add(t1, mul(e, c(-b[0].re, -b[0].im)));
+      expect(abs(add(p, mul(a, b[0]), mul(d, b[1])))).toBeLessThan(1e-14);
+      expect(norm(a, d)).toBeGreaterThan(norm(t0, t1));
+    }
+    // The broadband split already cancels this harmonic: nothing changes.
+    const exact = harmonicFactors(c(-b[0].re - b[1].re, -b[0].im - b[1].im), b, 'shared', WIDE);
+    expect(abs(add(exact.t[0]!, c(-1, 0)))).toBeLessThan(1e-15);
+    expect(abs(add(exact.t[1]!, c(-1, 0)))).toBeLessThan(1e-15);
+  });
+
+  it("'shared': a channel clamped at the trims' range leaves the rest to the other one", () => {
+    const rnd = mulberry32(42);
+    const draw = (): Complex => c(rnd() - 0.5, rnd() - 0.5);
+    const seen = { none: 0, oneExact: 0, both: 0 };
+    for (let i = 0; i < 4000; i++) {
+      const p = draw();
+      const b: [Complex, Complex] = [mul(draw(), c(0.6, 0)), mul(draw(), c(0.6, 0))];
+      const r = harmonicFactors(p, b, 'shared', TRIM);
+      const res = abs(add(p, mul(r.t[0]!, b[0]), mul(r.t[1]!, b[1])));
+      for (const ch of [0, 1] as const) {
+        expect(abs(r.t[ch]!)).toBeLessThanOrEqual(TRIM.max * (1 + 1e-9));
+        expect(abs(r.t[ch]!)).toBeGreaterThanOrEqual(TRIM.min * (1 - 1e-9));
+      }
+      if (!r.capped[0] && !r.capped[1]) {
+        expect(res).toBeLessThan(1e-12);
+        seen.none++;
+      } else if (r.capped[0] !== r.capped[1]) {
+        // The clamped one is at a bound; the other was re-solved against what is left and still nulls it.
+        const c0 = r.capped[0] ? 0 : 1;
+        const m = abs(r.t[c0]!);
+        expect(Math.min(Math.abs(m - TRIM.max), Math.abs(m - TRIM.min))).toBeLessThan(1e-12);
+        expect(res).toBeLessThan(1e-12);
+        seen.oneExact++;
+      } else seen.both++;
+    }
+    expect(seen.none).toBeGreaterThan(100);
+    expect(seen.oneExact).toBeGreaterThan(10);
+    expect(seen.both).toBeGreaterThan(10);
   });
 });

@@ -6,8 +6,8 @@ import type { Complex } from './complex.ts';
 import { DcBlocker, dcBlockerResponse } from './dc-blocker.ts';
 import { hilbertResponse } from './hilbert-pair.ts';
 import { clampParams, computeChannelDelay, dbToLin } from './params.ts';
-import type { EngineParams, FilterParams, TonalParams } from './params.ts';
-import { ResonatorBank, resonatorBankResponse } from './resonator-bank.ts';
+import type { EngineParams, FilterParams, HarmonicTrim, TonalParams } from './params.ts';
+import { ResonatorBank, resonatorBankResponseAt } from './resonator-bank.ts';
 
 /** Q of the 2nd-order protective high-pass (Butterworth). */
 export const HP_Q = Math.SQRT1_2;
@@ -40,6 +40,10 @@ const SLOTS = 4;
  * the new coefficients over COEFF_RAMP_MS (no click, see Biquad.setCoeffs and ResonatorBank.configure);
  * a section that becomes enabled starts from a clean state with its coefficients at once, and reset()
  * completes any glide.
+ * Harmonic trims: configure() ignores ChannelParams.harmonicTrims; setTrims() sets them (the engine passes
+ * its rate-limited values). process() returns the neutral output (the 'cond' tap) and leaves each channel's
+ * output in channelOut: in tonal mode with that channel's trims (channelConditioningResponse), otherwise, and
+ * with neutral trims, exactly the return value.
  */
 export class ConditioningChain {
   private readonly fs: number;
@@ -50,6 +54,8 @@ export class ConditioningChain {
   /** Coefficient glide length in samples. */
   private readonly ramp: number;
   private tonal = false;
+  /** Per-channel output of the last process() (see the class comment). */
+  readonly channelOut = new Float64Array(2);
 
   constructor(fs: number, params?: EngineParams) {
     this.fs = fs;
@@ -84,10 +90,26 @@ export class ConditioningChain {
     this.tonal = tonal;
   }
 
+  /**
+   * Harmonic trims of channel ch (tonal mode; kept across configure() and mode changes). rampSamples > 1
+   * (default COEFF_RAMP_MS): glide; ≤ 1: at once. See ResonatorBank.setTrims.
+   */
+  setTrims(ch: 0 | 1, trims: readonly HarmonicTrim[], rampSamples?: number): void {
+    this.bank.setTrims(ch, trims, rampSamples);
+  }
+
   process(x: number): number {
     let y = this.dc.process(Number.isFinite(x) ? x : 0);
     for (let i = 0; i < SLOTS; i++) if (this.active[i] === 1) y = this.slots[i].process(y);
-    return this.tonal ? this.bank.process(y) : y;
+    if (this.tonal) {
+      const c = this.bank.process(y);
+      this.channelOut[0] = this.bank.out[0];
+      this.channelOut[1] = this.bank.out[1];
+      return c;
+    }
+    this.channelOut[0] = y;
+    this.channelOut[1] = y;
+    return y;
   }
 
   reset(): void {
@@ -97,46 +119,86 @@ export class ConditioningChain {
   }
 }
 
-const tonalResponse = (t: TonalParams, fs: number, f: number): Complex =>
-  resonatorBankResponse(fs, f, t.f0, t.harmonics, t.q);
+const tonalResponseAt = (t: TonalParams, fs: number, trims?: readonly HarmonicTrim[]): ((f: number) => Complex) =>
+  resonatorBankResponseAt(fs, t.f0, t.harmonics, t.q, trims);
+
+/** Conditioning of clamped params; with `trims`, the tonal bank is that channel's trimmed bank. */
+function conditioningOf(q: EngineParams, fs: number, f: number, trims?: readonly HarmonicTrim[]): Complex {
+  return conditioningAt(q, fs, trims)(f);
+}
+
+/** conditioningOf as a function of f: the sections designed (and a trimmed bank's weights solved) once. */
+function conditioningAt(q: EngineParams, fs: number, trims?: readonly HarmonicTrim[]): (f: number) => Complex {
+  const s = conditioningSections(q.filters, fs);
+  const bank = q.phaseMode === 'tonal' ? tonalResponseAt(q.tonal, fs, trims) : null;
+  return (f) => {
+    let h = dcBlockerResponse(fs, f);
+    if (s.hp) h = cMul(h, biquadResponse(s.hp, f, fs));
+    if (s.barrier) h = cMul(h, biquadResponse(s.barrier, f, fs));
+    for (const c of s.bessel) h = cMul(h, biquadResponse(c, f, fs));
+    if (bank !== null) h = cMul(h, bank(f));
+    return h;
+  };
+}
 
 /**
  * Conditioning chain (DC blocker → HP if enabled → barrier LP if enabled → Bessel LP if enabled →
  * resonator bank if phaseMode === 'tonal'), exactly as the engine implements it (ConditioningChain).
- * `p` is clamped with clampParams first, as the engine does.
+ * `p` is clamped with clampParams first, as the engine does. This is the NEUTRAL chain (the 'cond' tap):
+ * harmonic trims are not included (see channelConditioningResponse).
  */
 export function conditioningResponse(p: EngineParams, fs: number, f: number): Complex {
+  return conditioningOf(clampParams(p), fs, f);
+}
+
+/**
+ * The conditioning channel ch actually gets: conditioningResponse with, in tonal mode, the channel's
+ * harmonic trims applied by the bank (ConditioningChain.channelOut[ch] at rest), including the response
+ * between the harmonics. Equal to conditioningResponse outside tonal mode or with neutral trims. At each used
+ * harmonic h·f0 it is conditioningResponse × 10^(gainDb/20)·e^{−j·phaseDeg·π/180} of harmonicTrims[h − 1].
+ */
+export function channelConditioningResponse(p: EngineParams, fs: number, f: number, ch: 0 | 1): Complex {
   const q = clampParams(p);
-  const s = conditioningSections(q.filters, fs);
-  let h = dcBlockerResponse(fs, f);
-  if (s.hp) h = cMul(h, biquadResponse(s.hp, f, fs));
-  if (s.barrier) h = cMul(h, biquadResponse(s.barrier, f, fs));
-  for (const c of s.bessel) h = cMul(h, biquadResponse(c, f, fs));
-  if (q.phaseMode === 'tonal') h = cMul(h, tonalResponse(q.tonal, fs, f));
-  return h;
+  return conditioningOf(q, fs, f, q.channels[ch].harmonicTrims);
 }
 
 /**
  * Full channel response from reference input to final output (before limiter, assuming no limiting):
- * conditioning · e^{-jω·computeChannelDelay(p, fs, ch).samples} · (hilbert rotation if mode hilbert,
- * i.e. cosΔ·A − sinΔ·B) · (−1 if polarityInvert) · channel gain · master gain. 0 if channel disabled.
+ * channelConditioningResponse (the conditioning with, in tonal mode, the channel's harmonic trims) ·
+ * e^{-jω·computeChannelDelay(p, fs, ch).samples} · (hilbert rotation if mode hilbert, i.e. cosΔ·A − sinΔ·B) ·
+ * (−1 if polarityInvert) · channel gain · master gain. 0 if channel disabled. The response of the trims'
+ * target (a rising trim reaches it at ≤ 6 dB/s in the engine).
  * The tap's Lagrange interpolation is modelled as an ideal delay (error < 0.01 dB / 0.001 samples
  * below 1 kHz at 48 kHz).
  */
 export function channelResponse(p: EngineParams, fs: number, f: number, ch: 0 | 1): Complex {
+  return channelResponseAt(p, fs, ch)(f);
+}
+
+/**
+ * channelResponse of channel ch as a function of f: `p` clamped, the conditioning designed, the trimmed bank's
+ * weights solved and the delay computed once — for evaluating one set of params at many frequencies (loop
+ * checks, predictions). The same values, computed the same way.
+ */
+export function channelResponseAt(p: EngineParams, fs: number, ch: 0 | 1): (f: number) => Complex {
   const q = clampParams(p);
   const c = q.channels[ch];
-  if (!c.enabled) return { re: 0, im: 0 };
-  let h = cMul(conditioningResponse(q, fs, f), cDelay(f, fs, computeChannelDelay(q, fs, ch).samples));
-  if (q.phaseMode === 'hilbert') {
-    const { a, b } = hilbertResponse(f, fs);
-    const d = (c.phaseDeltaDeg * Math.PI) / 180;
-    const cs = Math.cos(d);
-    const sn = Math.sin(d);
-    h = cMul(h, { re: cs * a.re - sn * b.re, im: cs * a.im - sn * b.im });
-  }
+  if (!c.enabled) return () => ({ re: 0, im: 0 });
+  const cond = conditioningAt(q, fs, c.harmonicTrims);
+  const samples = computeChannelDelay(q, fs, ch).samples;
+  const d = (c.phaseDeltaDeg * Math.PI) / 180;
+  const cs = Math.cos(d);
+  const sn = Math.sin(d);
   const g = (c.polarityInvert ? -1 : 1) * dbToLin(c.gainDb) * dbToLin(q.masterDb);
-  return { re: h.re * g, im: h.im * g };
+  const hilbert = q.phaseMode === 'hilbert';
+  return (f) => {
+    let h = cMul(cond(f), cDelay(f, fs, samples));
+    if (hilbert) {
+      const { a, b } = hilbertResponse(f, fs);
+      h = cMul(h, { re: cs * a.re - sn * b.re, im: cs * a.im - sn * b.im });
+    }
+    return { re: h.re * g, im: h.im * g };
+  };
 }
 
 /**

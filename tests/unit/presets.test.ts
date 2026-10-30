@@ -6,7 +6,7 @@ import {
   sanitizePreset,
   type Preset,
 } from '../../src/app/presets.ts';
-import { DEFAULT_PARAMS, HEADPHONES_CEILING_DB, RANGES, clampParams, type EngineParams } from '../../src/dsp/params.ts';
+import { DEFAULT_PARAMS, HEADPHONES_CEILING_DB, RANGES, clampParams, neutralTrims, type EngineParams } from '../../src/dsp/params.ts';
 import { deviceKey, type DeviceOption } from '../../src/audio/devices.ts';
 
 /** In-memory Storage stub; `fail` makes the chosen operations throw like a full or blocked storage. */
@@ -186,6 +186,66 @@ describe('sanitizePreset', () => {
     const cyclic: Record<string, unknown> = { a: 1 };
     cyclic.self = cyclic;
     expect('calibration' in sanitizePreset(raw({ calibration: cyclic }))!).toBe(false);
+  });
+});
+
+describe('harmonic trims in presets', () => {
+  const trimmed = (): EngineParams =>
+    params((p) => {
+      p.phaseMode = 'tonal';
+      p.channels[0].harmonicTrims[0] = { gainDb: -2.25, phaseDeg: 17.5 };
+      p.channels[1].harmonicTrims[3] = { gainDb: 5.5, phaseDeg: -140 };
+    });
+
+  it('a preset saved before the trims existed loads with every trim at 0', () => {
+    const old = params() as unknown as { channels: Record<string, unknown>[] };
+    for (const c of old.channels) delete c['harmonicTrims'];
+    const p = sanitizePreset(raw({ params: old }))!;
+    for (const c of p.params.channels) expect(c.harmonicTrims).toEqual(neutralTrims());
+  });
+
+  it('sanitises trims: clamped, non-finite or wrong types → 0, padded / truncated to 8, copies', () => {
+    const bad = params() as unknown as { channels: Record<string, unknown>[] };
+    const src = [{ gainDb: 40, phaseDeg: -900 }, { gainDb: 'x', phaseDeg: null }, null, 7, { gainDb: -3 }];
+    bad.channels[0]['harmonicTrims'] = src;
+    bad.channels[1]['harmonicTrims'] = Array.from({ length: 12 }, () => ({ gainDb: -1, phaseDeg: 2 }));
+    const p = sanitizePreset(raw({ params: bad }))!;
+    expect(p.params.channels[0].harmonicTrims.slice(0, 5)).toEqual([
+      { gainDb: RANGES.trimGainDb.max, phaseDeg: RANGES.trimPhaseDeg.min },
+      { gainDb: 0, phaseDeg: 0 },
+      { gainDb: 0, phaseDeg: 0 },
+      { gainDb: 0, phaseDeg: 0 },
+      { gainDb: -3, phaseDeg: 0 },
+    ]);
+    expect(p.params.channels[0].harmonicTrims).toHaveLength(8);
+    expect(p.params.channels[1].harmonicTrims).toHaveLength(8);
+    expect(p.params.channels[0].harmonicTrims[0]).not.toBe(src[0]);
+    const notArray = params() as unknown as { channels: Record<string, unknown>[] };
+    notArray.channels[1]['harmonicTrims'] = { 0: { gainDb: 3, phaseDeg: 3 } };
+    expect(sanitizePreset(raw({ params: notArray }))!.params.channels[1].harmonicTrims).toEqual(neutralTrims());
+  });
+
+  it('round trip: save → storage → list → export → import keeps the trims exactly', () => {
+    const { storage } = memStorage();
+    const store = new PresetStore(storage);
+    const saved = store.save('Tonale', trimmed(), META);
+    expect(saved.params.channels[0].harmonicTrims[0]).toEqual({ gainDb: -2.25, phaseDeg: 17.5 });
+    const again = new PresetStore(storage).get(saved.id)!;
+    expect(again.params.channels).toEqual(trimmed().channels);
+    const other = new PresetStore(null);
+    expect(other.importJson(store.exportJson())).toEqual({ imported: 1, rejected: 0 });
+    expect(other.get(saved.id)!.params.channels).toEqual(trimmed().channels);
+    // Copies: changing one does not change the store.
+    again.params.channels[1].harmonicTrims[3].gainDb = -30;
+    expect(store.get(saved.id)!.params.channels[1].harmonicTrims[3].gainDb).toBe(5.5);
+  });
+
+  it('mismatchWarnings does not depend on the trims', () => {
+    const plain = sanitizePreset(raw())!;
+    const withTrims = sanitizePreset(raw({ params: trimmed() }))!;
+    for (const cur of [{ deviceKey: META.deviceKey, sampleRate: 48000 }, { deviceKey: 'k1|in:B@1|out:B@2', sampleRate: 44100 }]) {
+      expect(mismatchWarnings(withTrims, cur)).toEqual(mismatchWarnings(plain, cur));
+    }
   });
 });
 

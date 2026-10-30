@@ -1,19 +1,26 @@
 /**
  * One output channel (L or R): enable, polarity, gain, delay (ms / µs / campioni / cm), fine Δ
  * phase with the total-phase readout, output meter, limiter badge and the clamped-delay warning.
+ * In tonal mode a collapsible «Armoniche» section trims each harmonic's gain and phase
+ * (ChannelParams.harmonicTrims) and shows the total phase there (polarity + h·Δ + θ_h).
  * The link toggle only reports intent (onLinkChange); applying the offset is the controller's job.
  */
 import type { MeterSnapshot } from '../audio/protocol.ts';
-import { DEFAULT_PARAMS, RANGES, dbToLin } from '../dsp/params.ts';
-import type { ChannelParams, PhaseMode } from '../dsp/params.ts';
+import { anyTrim } from '../dsp/harmonic-trims.ts';
+import { DEFAULT_PARAMS, MAX_HARMONICS, RANGES, dbToLin } from '../dsp/params.ts';
+import type { ChannelParams, HarmonicTrim, PhaseMode } from '../dsp/params.ts';
 import { createLevelMeter } from './meters-view.ts';
 import { createPrecisionControl } from './precision-control.ts';
+import type { PrecisionControl } from './precision-control.ts';
 import {
+  BANK_MAX_FRACTION,
+  bankHarmonics,
   delayUnits,
   formatAdaptive,
   formatHz,
   formatNumber,
   formatSigned,
+  harmonicTotalPhaseDeg,
   phaseDeltaToMs,
   totalPhaseDeg,
 } from './units.ts';
@@ -33,6 +40,10 @@ export interface ChannelStripInfo {
   gainUnlocked?: boolean;
   /** Current L/R link state (owned by the controller). */
   linked?: boolean;
+  /** Tonal mode: harmonics of the resonator bank (rows of «Armoniche»; f0 is phaseRefHz). */
+  harmonics?: number;
+  /** The other channel has trims: while linked, this channel's «Azzera armoniche» clears them too. */
+  otherTrimmed?: boolean;
 }
 
 export interface ChannelStripOptions {
@@ -41,6 +52,11 @@ export interface ChannelStripOptions {
   /** Full new channel params plus the field the user changed (lets the controller apply links). */
   onChange: (next: ChannelParams, changed: keyof ChannelParams) => void;
   onLinkChange: (linked: boolean) => void;
+  /**
+   * «Azzera armoniche»: every trim of this channel to 0, an absolute reset that the controller must not apply
+   * as a linked delta (controller.clearHarmonicTrims). Without it the strip sends all-zero trims to onChange.
+   */
+  onClearTrims?: () => void;
 }
 
 export interface ChannelStrip {
@@ -50,6 +66,23 @@ export interface ChannelStrip {
 }
 
 const LIMITER_BADGE_DB = 0.1;
+
+/** MAX_HARMONICS trims as new objects (missing entries neutral): never share the controller's array. */
+export function copyTrims(trims: readonly HarmonicTrim[] | undefined): HarmonicTrim[] {
+  return Array.from({ length: MAX_HARMONICS }, (_, i) => {
+    const t = trims?.[i];
+    return { gainDb: t?.gainDb ?? 0, phaseDeg: t?.phaseDeg ?? 0 };
+  });
+}
+
+interface HarmonicRow {
+  root: HTMLElement;
+  title: HTMLElement;
+  total: HTMLElement;
+  gain: PrecisionControl;
+  phase: PrecisionControl;
+  key: string;
+}
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, className?: string, text?: string): HTMLElementTagNameMap[K] {
   const e = document.createElement(tag);
@@ -70,7 +103,8 @@ function switchButton(text: string): HTMLButtonElement {
 
 export function createChannelStrip(container: HTMLElement, opts: ChannelStripOptions): ChannelStrip {
   const idx: 0 | 1 = opts.channel === 'L' ? 0 : 1;
-  let params: ChannelParams = { ...(opts.initial ?? DEFAULT_PARAMS.channels[idx]) };
+  const init = opts.initial ?? DEFAULT_PARAMS.channels[idx];
+  let params: ChannelParams = { ...init, harmonicTrims: copyTrims(init.harmonicTrims) };
   let info: ChannelStripInfo = { fs: 48000, speedOfSound: 343, phaseRefHz: DEFAULT_PARAMS.fRef };
   let linked = false;
   const titleId = `strip-${opts.channel}-title`;
@@ -100,7 +134,8 @@ export function createChannelStrip(container: HTMLElement, opts: ChannelStripOpt
     params = { ...params, ...patch };
     renderToggles();
     renderReadouts();
-    opts.onChange({ ...params }, changed);
+    renderHarmonics();
+    opts.onChange({ ...params, harmonicTrims: copyTrims(params.harmonicTrims) }, changed);
   };
 
   const gain = createPrecisionControl(controls, {
@@ -155,11 +190,92 @@ export function createChannelStrip(container: HTMLElement, opts: ChannelStripOpt
   clampWarn.setAttribute('role', 'status');
   clampWarn.hidden = true;
 
+  // ---- «Armoniche» (tonal mode): one gain and one phase trim per harmonic, on top of the delay.
+  const harm = el('details', 'advanced strip-harm');
+  harm.hidden = true;
+  const harmSummary = el('summary');
+  const harmCount = el('span', 'strip-harm-count');
+  harmSummary.append('Armoniche', harmCount);
+  const harmBody = el('div', 'advanced-body strip-harm-body');
+  const harmHelp = el(
+    'p',
+    'fp-help',
+    'Correzione di guadagno e di fase di ogni armonica, in aggiunta al ritardo (fase positiva = ritardo). La calcolano la ' +
+      'configurazione guidata e l’autotune; gli aumenti oltre 6 dB salgono a 6 dB al secondo.',
+  );
+  const harmList = el('div', 'strip-harm-list');
+  const harmSkipped = el('p', 'fp-help');
+  harmSkipped.hidden = true;
+  const harmReset = el('button', 'btn btn--small strip-harm-reset', 'Azzera armoniche');
+  harmReset.type = 'button';
+  harmReset.setAttribute('aria-label', `Azzera le correzioni delle armoniche del canale ${opts.channel}`);
+  const harmActions = el('div', 'strip-harm-actions');
+  harmActions.append(harmReset);
+  harmBody.append(harmHelp, harmList, harmSkipped, harmActions);
+  harm.append(harmSummary, harmBody);
+
+  const setTrim = (h: number, patch: Partial<HarmonicTrim>): void => {
+    const trims = copyTrims(params.harmonicTrims);
+    trims[h - 1] = { ...trims[h - 1]!, ...patch };
+    emit('harmonicTrims', { harmonicTrims: trims });
+  };
+
+  const rows: HarmonicRow[] = [];
+  for (let h = 1; h <= MAX_HARMONICS; h++) {
+    const rowRoot = el('div', 'strip-harm-row');
+    rowRoot.setAttribute('role', 'group');
+    rowRoot.hidden = true;
+    const titleEl = el('span', 'strip-harm-title');
+    titleEl.id = `strip-${opts.channel}-h${h}-title`;
+    rowRoot.setAttribute('aria-labelledby', titleEl.id);
+    const total = el('span', 'strip-harm-total');
+    const rowHead = el('p', 'strip-harm-head');
+    rowHead.append(titleEl, total);
+    const rowControls = el('div', 'strip-harm-controls');
+    const gainCtl = createPrecisionControl(rowControls, {
+      label: `Guadagno armonica ${h}`,
+      value: 0,
+      min: RANGES.trimGainDb.min,
+      max: RANGES.trimGainDb.max,
+      step: 0.01,
+      unit: 'dB',
+      resetValue: 0,
+      resetLabel: 'nessuna correzione',
+      compact: true,
+      onChange: (v) => setTrim(h, { gainDb: v }),
+    });
+    const phaseCtl = createPrecisionControl(rowControls, {
+      label: `Fase armonica ${h}`,
+      value: 0,
+      min: RANGES.trimPhaseDeg.min,
+      max: RANGES.trimPhaseDeg.max,
+      step: 0.1,
+      unit: '°',
+      resetValue: 0,
+      resetLabel: 'nessuna correzione',
+      compact: true,
+      onChange: (v) => setTrim(h, { phaseDeg: v }),
+    });
+    rowRoot.append(rowHead, rowControls);
+    harmList.append(rowRoot);
+    rows.push({ root: rowRoot, title: titleEl, total, gain: gainCtl, phase: phaseCtl, key: '' });
+  }
+
+  harmReset.addEventListener('click', () => {
+    if (opts.onClearTrims === undefined) {
+      emit('harmonicTrims', { harmonicTrims: copyTrims(undefined) });
+      return;
+    }
+    params = { ...params, harmonicTrims: copyTrims(undefined) };
+    renderHarmonics();
+    opts.onClearTrims();
+  });
+
   const meterBox = el('div', 'strip-meter');
   const meter = createLevelMeter(meterBox, { label: `Uscita ${opts.channel}` });
   const actual = el('p', 'strip-actual num');
 
-  root.append(head, toggles, controls, phaseReadout, clampWarn, meterBox, actual);
+  root.append(head, toggles, controls, phaseReadout, clampWarn, harm, meterBox, actual);
   container.append(root);
 
   function renderToggles(): void {
@@ -171,7 +287,11 @@ export function createChannelStrip(container: HTMLElement, opts: ChannelStripOpt
 
   let lastPhaseKey = '';
   function renderReadouts(): void {
-    const total = totalPhaseDeg(params.polarityInvert, params.phaseDeltaDeg);
+    // Tonal mode: the total phase at f0 includes the fundamental's trim θ_1 (as the «Fondamentale» row).
+    const total =
+      info.phaseMode === 'tonal'
+        ? harmonicTotalPhaseDeg(params.polarityInvert, params.phaseDeltaDeg, 1, params.harmonicTrims[0]?.phaseDeg ?? 0)
+        : totalPhaseDeg(params.polarityInvert, params.phaseDeltaDeg);
     // Called at meter rate: rebuild only when the text changes.
     const key = `${total}|${info.phaseRefHz}`;
     if (key === lastPhaseKey) return;
@@ -181,6 +301,58 @@ export function createChannelStrip(container: HTMLElement, opts: ChannelStripOpt
       el('strong', 'num', `${formatAdaptive(total, 1)}°`),
       ` @ ${formatHz(info.phaseRefHz)}`,
     );
+  }
+
+  let lastHarmKey = '';
+  /** «Armoniche»: rows, readouts and reset values; called at meter rate, so only what changed is touched. */
+  function renderHarmonics(): void {
+    const tonal = info.phaseMode === 'tonal';
+    harm.hidden = !tonal;
+    if (!tonal) return;
+    const f0 = info.phaseRefHz;
+    const used = bankHarmonics(info.harmonics ?? 1, f0, info.fs);
+    const trims = params.harmonicTrims;
+    const cal = info.calibrated?.harmonicTrims ?? null;
+    for (let h = 1; h <= MAX_HARMONICS; h++) {
+      const row = rows[h - 1]!;
+      const on = used.includes(h);
+      row.root.hidden = !on;
+      if (!on) continue;
+      const t = trims[h - 1] ?? { gainDb: 0, phaseDeg: 0 };
+      const c = cal?.[h - 1] ?? null;
+      const total = harmonicTotalPhaseDeg(params.polarityInvert, params.phaseDeltaDeg, h, t.phaseDeg);
+      const key = `${t.gainDb}|${t.phaseDeg}|${c ? `${c.gainDb}|${c.phaseDeg}` : '-'}|${f0}|${total}`;
+      // The controls also follow a value the controller kept although the user typed another one.
+      if (key === row.key && row.gain.value === t.gainDb && row.phase.value === t.phaseDeg) continue;
+      row.key = key;
+      const resetLabel = c ? 'valore calibrato' : 'nessuna correzione';
+      row.gain.update(t.gainDb, { resetValue: c ? c.gainDb : 0, resetLabel });
+      row.phase.update(t.phaseDeg, { resetValue: c ? c.phaseDeg : 0, resetLabel });
+      row.title.textContent = `${h === 1 ? 'Fondamentale' : `Armonica ${h}`} · ${formatHz(h * f0)}`;
+      row.total.replaceChildren('Fase totale ', el('strong', 'num', `${formatAdaptive(total, 1)}°`));
+    }
+    const n = f0 > 0 ? Math.min(MAX_HARMONICS, Math.max(1, Math.round(info.harmonics ?? 1))) : 0;
+    const trimmed = used.filter((h) => anyTrim([trims[h - 1] ?? { gainDb: 0, phaseDeg: 0 }], 1)).length;
+    // Trims of harmonics not in use count for the reset too (they come back with more harmonics).
+    const any = anyTrim(trims);
+    // Linked, the reset clears both channels (its label says so): it can be pressed while either has trims.
+    const resettable = any || (linked && info.otherTrimmed === true);
+    const key = `${n}|${used.length}|${trimmed}|${resettable}|${info.fs}|${linked}`;
+    if (key === lastHarmKey) return;
+    lastHarmKey = key;
+    harmCount.textContent = trimmed > 0 ? ` · ${trimmed} ${trimmed === 1 ? 'corretta' : 'corrette'}` : '';
+    harmReset.disabled = !resettable;
+    const resetLabel = linked
+      ? 'Azzera le correzioni delle armoniche dei canali L e R (collegati)'
+      : `Azzera le correzioni delle armoniche del canale ${opts.channel}`;
+    if (harmReset.getAttribute('aria-label') !== resetLabel) harmReset.setAttribute('aria-label', resetLabel);
+    const skipped = n - used.length;
+    harmSkipped.hidden = skipped === 0;
+    harmSkipped.textContent =
+      skipped > 0
+        ? `${skipped === 1 ? 'L’ultima armonica supera' : `Le ultime ${skipped} armoniche superano`} il 45 % della frequenza di ` +
+          `campionamento (${formatHz(BANK_MAX_FRACTION * info.fs)}): il banco non le genera.`
+        : '';
   }
 
   enabledBtn.addEventListener('click', () => emit('enabled', { enabled: !params.enabled }));
@@ -193,12 +365,13 @@ export function createChannelStrip(container: HTMLElement, opts: ChannelStripOpt
 
   renderToggles();
   renderReadouts();
+  renderHarmonics();
   meter.update(null);
 
   return {
     element: root,
     update(next: ChannelParams, meters: MeterSnapshot | null, nextInfo: ChannelStripInfo): void {
-      params = { ...next };
+      params = { ...next, harmonicTrims: copyTrims(next.harmonicTrims) };
       info = { ...nextInfo };
       if (nextInfo.linked !== undefined) linked = nextInfo.linked;
       const cal = nextInfo.calibrated ?? null;
@@ -213,6 +386,7 @@ export function createChannelStrip(container: HTMLElement, opts: ChannelStripOpt
       phase.update(params.phaseDeltaDeg, { resetValue: cal ? cal.phaseDeltaDeg : 0 });
       renderToggles();
       renderReadouts();
+      renderHarmonics();
 
       const out = meters ? (idx === 0 ? meters.outL : meters.outR) : null;
       meter.update(params.enabled ? out : null);
@@ -238,6 +412,10 @@ export function createChannelStrip(container: HTMLElement, opts: ChannelStripOpt
       gain.destroy();
       delay.destroy();
       phase.destroy();
+      for (const r of rows) {
+        r.gain.destroy();
+        r.phase.destroy();
+      }
       meter.destroy();
       root.remove();
     },

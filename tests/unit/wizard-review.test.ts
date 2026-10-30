@@ -4,7 +4,8 @@
  * detection in the tonal autotune (plan-2), Italian howl alarms (ui-14), loopback in samples
  * (plan-10).
  */
-import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { describe, expect, it, vi } from 'vitest';
 import { calibrationFreqs, checkLoop, createCalibration, LOOP_GAIN_DANGER_DB, pathResponse, solveFromCalibration } from '../../src/audio/calibration.ts';
 import type { CalibrationData, PathData } from '../../src/audio/calibration.ts';
 import { TAP_BLOCK_FRAMES, TAP_CHANNELS } from '../../src/audio/protocol.ts';
@@ -19,8 +20,11 @@ import {
   gainLimitedAttenuationDb,
   harmonicLevelDbfs,
   howlAlarmText,
-  MasterRampTracker,
+  liveMasterDb,
+  MASTER_READY_TOL_DB,
+  masterReached,
   masterSettleMs,
+  masterWaitTimeoutMs,
   isLoopAdvice,
   mergedZonesLoop,
   mergeZoneSolutions,
@@ -29,6 +33,7 @@ import {
 } from '../../src/ui/wizard/logic.ts';
 import { NOISE_INTERRUPTED_TEXT, autotuneDriver, errorLevelDbfs, playLevelNoise } from '../../src/ui/wizard/ops.ts';
 import { loopOutcomeText } from '../../src/ui/wizard/step-align.ts';
+import { masterTimeoutText } from '../../src/ui/wizard/step-amp.ts';
 import { loopLevelsText, loopRunText } from '../../src/ui/wizard/step-measure.ts';
 
 const FS = 48000;
@@ -58,31 +63,44 @@ describe('master ramp before the amplifier-level noise (safety-1)', () => {
     expect(masterSettleMs(0, -20)).toBeLessThan(200);
   });
 
-  it('also covers a rise right after another one (empty rise budget)', () => {
-    const real = rampTimeMs(-10, 0, (r) => {
+  it('step 2 waits for the live master: within 0.1 dB of the target, silence matches silence', () => {
+    expect(MASTER_READY_TOL_DB).toBe(0.1);
+    expect(masterReached(-0.09, 0)).toBe(true);
+    expect(masterReached(-0.11, 0)).toBe(false);
+    expect(masterReached(0.05, 0)).toBe(true);
+    expect(masterReached(null, 0)).toBe(false);
+    expect(masterReached(-120, -120)).toBe(true);
+    expect(masterReached(-119.95, -Infinity)).toBe(false);
+    expect(masterReached(-60, -120)).toBe(false);
+    // Meters missing, or from an engine that does not report the master: unknown, never "arrived".
+    expect(liveMasterDb({ meters: null })).toBeNull();
+    expect(liveMasterDb({ meters: {} })).toBeNull();
+    expect(liveMasterDb({ meters: { masterDb: Number.NaN } })).toBeNull();
+    expect(liveMasterDb({ meters: { masterDb: -12.5 } })).toBe(-12.5);
+  });
+
+  it('the README gives the range of seconds the step shows when the master is not confirmed (rounded up)', () => {
+    const shown = [null, ...Array.from({ length: 121 }, (_, i) => -i)].map((from) => Math.ceil(masterWaitTimeoutMs(from, 0) / 1000));
+    expect(Math.min(...shown)).toBe(10);
+    expect(Math.max(...shown)).toBe(13);
+    expect(masterTimeoutText(masterWaitTimeoutMs(null, 0))).toContain('entro 13 s');
+    const readme = readFileSync(new URL('../../README.md', import.meta.url), 'utf8');
+    expect(readme).toContain(`entro ${Math.min(...shown)}–${Math.max(...shown)} s`);
+  });
+
+  it('its timeout outlasts the slowest real ramp (from silence, empty rise budget), and is at least 10 s', () => {
+    for (const from of [-120, -80, -60, -30, -6, 0]) {
+      expect(masterWaitTimeoutMs(from, 0), `from ${from} dB`).toBeGreaterThan(rampTimeMs(from, 0) + 1000);
+      expect(masterWaitTimeoutMs(from, 0)).toBeGreaterThanOrEqual(10_000);
+    }
+    // Unknown start: as from silence.
+    expect(masterWaitTimeoutMs(null, 0)).toBe(masterWaitTimeoutMs(-120, 0));
+    expect(masterWaitTimeoutMs(null, 0)).toBeLessThan(15_000);
+    const afterRise = rampTimeMs(-10, 0, (r) => {
       r.setTargetDb(-4);
       for (let n = 0; n < FS * 0.2; n++) r.next();
     });
-    const t = new MasterRampTracker();
-    t.observe(-10, true, 0);
-    t.observe(-4, true, 0);
-    t.observe(0, true, 200);
-    expect(t.readyInMs(200)).toBeGreaterThanOrEqual(real);
-  });
-
-  it('the tracker waits only for rises on an armed output', () => {
-    const t = new MasterRampTracker();
-    t.observe(-30, true, 1000);
-    expect(t.readyInMs(1000)).toBe(0);
-    t.observe(0, true, 1000);
-    expect(t.readyInMs(1000)).toBeCloseTo(masterSettleMs(-30, 0), 6);
-    expect(t.readyInMs(1000 + masterSettleMs(-30, 0))).toBe(0);
-    // Disarmed: the engine applies parameters at once (and arming starts from them).
-    const u = new MasterRampTracker();
-    u.observe(-30, false, 0);
-    u.observe(0, false, 0);
-    u.observe(0, true, 0);
-    expect(u.readyInMs(0)).toBe(0);
+    expect(masterWaitTimeoutMs(-10, 0)).toBeGreaterThan(afterRise + 1000);
   });
 });
 
@@ -345,6 +363,57 @@ describe('tonal autotune measures the harmonics of f0 (plan-2)', () => {
       for (const cb of [...taps]) cb(block, TAP_BLOCK_FRAMES);
     }
     expect(await pending).toBeCloseTo(20 * Math.log10(0.05 / Math.SQRT2), 0);
+  });
+
+  it('reads each harmonic on its own for the per-harmonic trim search, bypassing the anti-noise when asked', async () => {
+    vi.useFakeTimers();
+    try {
+      const params = clampParams({ ...DEFAULT_PARAMS, phaseMode: 'tonal', tonal: { f0: 100, harmonics: 2, q: 30 } });
+      const taps = new Set<(b: Float32Array, frames: number) => void>();
+      const bypass: boolean[] = [];
+      const controller = {
+        state: { params, fs: FS },
+        onTap(cb: (b: Float32Array, frames: number) => void) {
+          taps.add(cb);
+          return () => taps.delete(cb);
+        },
+        setBypass(on: boolean) {
+          bypass.push(on);
+        },
+      } as unknown as AppController;
+      let measured = 0;
+      const drv = autotuneDriver(controller, { fs: FS, band, signal: new AbortController().signal, onMeasure: () => measured++ });
+      expect(drv.measureHarmonicsDb).toBeDefined();
+      // −50 dBFS noise, 100 Hz at amplitude 0.05 and 200 Hz at 0.015.
+      const rnd = mulberry32(11);
+      const x = new Float32Array(Math.round(0.2 * FS)).map(
+        (_v, i) => 0.003 * Math.sqrt(3) * (2 * rnd() - 1) + 0.05 * Math.sin((2 * Math.PI * 100 * i) / FS) + 0.015 * Math.sin((2 * Math.PI * 200 * i) / FS),
+      );
+      const feed = (): void => {
+        const iErr = TAP_CHANNELS.indexOf('err');
+        for (let b = 0; b * TAP_BLOCK_FRAMES < x.length; b++) {
+          const block = new Float32Array(TAP_CHANNELS.length * TAP_BLOCK_FRAMES);
+          block.set(x.subarray(b * TAP_BLOCK_FRAMES, (b + 1) * TAP_BLOCK_FRAMES), iErr * TAP_BLOCK_FRAMES);
+          for (const cb of [...taps]) cb(block, TAP_BLOCK_FRAMES);
+        }
+      };
+      const on = drv.measureHarmonicsDb!(200, [100, 200], false);
+      feed();
+      const levels = await on;
+      expect(Math.abs(levels[0]! - 20 * Math.log10(0.05 / Math.SQRT2))).toBeLessThan(0.2);
+      expect(Math.abs(levels[1]! - 20 * Math.log10(0.015 / Math.SQRT2))).toBeLessThan(0.2);
+      expect(bypass).toEqual([]);
+      // Bypassed: the anti-noise goes off, the room settles, the window is recorded, the anti-noise comes back.
+      const off = drv.measureHarmonicsDb!(200, [100], true);
+      expect(bypass).toEqual([true]);
+      await vi.advanceTimersByTimeAsync(400);
+      feed();
+      expect((await off)[0]).toBeCloseTo(20 * Math.log10(0.05 / Math.SQRT2), 0);
+      expect(bypass).toEqual([true, false]);
+      expect(measured).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

@@ -3,16 +3,27 @@
  * playwright.config.ts): page load under the production CSP, exact zeros before «Attiva uscita»,
  * the DSP identity out = −g·cond[n − D] after the soft-start, PANIC timing, lifecycle auto-mutes and
  * preset sanitising. Every test also fails on console errors, CSP violations and on any fault,
- * processorerror or howl event. Actions go through the real buttons and keys; levels and values are
- * read from the text readouts, samples from the tap blocks of window.__anc.
+ * processorerror or howl event (the guard in app-page.ts). Actions go through the real buttons and keys;
+ * levels and values are read from the text readouts, samples from the tap blocks of window.__anc.
  */
-import { expect, test as base } from '@playwright/test';
-import type { Locator, Page } from '@playwright/test';
-import type { E2eEvent, E2eTap } from '../src/app/e2e-hooks.ts';
+import type { Page } from '@playwright/test';
+import type { E2eTap } from '../src/app/e2e-hooks.ts';
 import { TAP_BLOCK_FRAMES, TAP_CHANNELS } from '../src/audio/protocol.ts';
 import { DEFAULT_PARAMS, D_MIN_SAMPLES } from '../src/dsp/params.ts';
 import type { EngineParams } from '../src/dsp/params.ts';
 import { formatNumber, parseNumber } from '../src/ui/units.ts';
+import {
+  allowMicrophone,
+  enableOutput,
+  expect,
+  freshTaps,
+  openApp,
+  sampleRate,
+  statusChip,
+  statusMessage,
+  strip,
+  test,
+} from './app-page.ts';
 import { bestIntegerLag, dbToLin, fitAlignment, silenceAfterEscape, splitBlocks } from './helpers.ts';
 import type { FixtureName, RecordedBlock } from './helpers.ts';
 
@@ -21,132 +32,9 @@ const SILENCE = 1e-6;
 const PANIC_DEADLINE_S = 0.05;
 const MIN_CORRELATION = 0.99;
 
-// ------------------------------------------------------------------------------ guard fixture
-
-function isBadEvent(e: E2eEvent): boolean {
-  if (e.type === 'fault' || e.type === 'howl') return true;
-  if (e.type !== 'lifecycle') return false;
-  if (e.source === 'engine') return (e.detail as { cause?: unknown } | undefined)?.cause === 'processorerror';
-  return typeof e.detail === 'string' && e.detail.startsWith('processorerror');
-}
-
-const test = base.extend<{ guard: void }>({
-  guard: [
-    async ({ page }, use, testInfo) => {
-      const consoleErrors: string[] = [];
-      page.on('console', (m) => {
-        if (m.type() !== 'error') return;
-        consoleErrors.push(`${m.text()} (${m.location().url})`);
-      });
-      page.on('pageerror', (e) => consoleErrors.push(`pageerror: ${e.message}`));
-      // Runs before the app's scripts: CSP reports and the exact time of every Escape keydown.
-      await page.addInitScript(() => {
-        const probe = { csp: [] as string[], esc: [] as number[] };
-        window.__e2e = probe;
-        document.addEventListener(
-          'securitypolicyviolation',
-          (e) => probe.csp.push(`${e.effectiveDirective} ${e.blockedURI}`),
-          true,
-        );
-        window.addEventListener(
-          'keydown',
-          (e) => {
-            if (e.key === 'Escape') probe.esc.push(performance.now());
-          },
-          true,
-        );
-      });
-
-      await use();
-
-      const after = await page
-        .evaluate(() => ({ csp: window.__e2e?.csp ?? [], events: window.__anc?.events ?? [] }))
-        .catch((err: unknown) => ({ csp: [`page not readable: ${String(err)}`], events: [] as E2eEvent[] }));
-      if (testInfo.status !== testInfo.expectedStatus) {
-        await testInfo.attach('events.json', { body: JSON.stringify(after.events, null, 2), contentType: 'application/json' });
-      }
-      const bad = after.events.filter(isBadEvent).map((e) => `${e.source}:${e.type} ${JSON.stringify(e.detail)}`);
-      expect(consoleErrors, 'console errors').toEqual([]);
-      expect(after.csp, 'CSP violations').toEqual([]);
-      expect(bad, 'fault / processorerror / howl events').toEqual([]);
-    },
-    { auto: true },
-  ],
-});
-
 // ------------------------------------------------------------------------------ page helpers
 
-const statusChip = (page: Page): Locator => page.locator('.status-bar .sb-state');
-const statusMessage = (page: Page): Locator => page.locator('.status-bar .sb-message-text');
-const strip = (page: Page, ch: 'L' | 'R'): Locator => page.getByRole('article', { name: `Canale ${ch}` });
-
 const maxAbs = (v: readonly number[]): number => v.reduce((m, x) => Math.max(m, Math.abs(x)), 0);
-
-async function openApp(page: Page): Promise<void> {
-  await page.goto('/');
-  await page.waitForFunction(() => window.__anc !== undefined);
-}
-
-/** getUserMedia with the fake device normally resolves in well under a second. */
-const MIC_OPEN_TIMEOUT_MS = 20_000;
-
-async function allowMicrophone(page: Page): Promise<void> {
-  await page.locator('#devices').getByRole('button', { name: 'Consenti microfono' }).click();
-  try {
-    await page.waitForFunction(
-      () => {
-        const s = window.__anc!.controller.state;
-        return s.micOpen && !s.opening;
-      },
-      undefined,
-      { timeout: MIC_OPEN_TIMEOUT_MS },
-    );
-  } catch {
-    const s = await page.evaluate(() => {
-      const a = window.__anc!;
-      return { opening: a.controller.state.opening, micError: a.controller.state.micError, engine: a.engine.state, ctx: a.engine.contextState };
-    });
-    throw new Error(
-      `«Consenti microfono» did not open the fake microphone within ${MIC_OPEN_TIMEOUT_MS / 1000} s ` +
-        `(${JSON.stringify(s)}). If getUserMedia never settles, Chrome's audio service is blocked by the OS ` +
-        '(on macOS: microphone permission of the app that runs Playwright, or CoreAudio not answering).',
-    );
-  }
-}
-
-async function sampleRate(page: Page): Promise<number> {
-  const fs = await page.evaluate(() => window.__anc!.controller.sampleRate);
-  if (fs === null) throw new Error('sample rate unknown');
-  return fs;
-}
-
-/** «Attiva uscita» once validation passes; resolves when the 1.5 s soft-start has completed. */
-async function enableOutput(page: Page): Promise<void> {
-  await expect
-    .poll(
-      () =>
-        page.evaluate(() => {
-          const s = window.__anc!.controller.state;
-          if (s.canArm) return 'ok';
-          const open = s.validation.issues.filter((i) => i.level === 'block' || (i.level === 'error' && !i.overridden));
-          return open.map((i) => i.text).join(' | ') || 'not armable yet';
-        }),
-      { message: 'validation must pass with the fake microphone' },
-    )
-    .toBe('ok');
-  await page.locator('#output-gate').getByRole('button', { name: 'Attiva uscita' }).click();
-  await expect(statusChip(page)).toHaveText('Attivo');
-}
-
-/** The last `blocks` tap blocks, all delivered after this call started. */
-async function freshTaps(page: Page, blocks: number): Promise<E2eTap> {
-  const seq0 = await page.evaluate(() => window.__anc!.lastTap()?.seq ?? 0);
-  await page.waitForFunction((target) => (window.__anc!.lastTap()?.seq ?? 0) >= target, seq0 + blocks, { polling: 50 });
-  const tap = await page.evaluate((n) => window.__anc!.lastTap(n), blocks);
-  if (tap === null) throw new Error('no tap blocks');
-  expect(tap.frames).toBe(blocks * TAP_BLOCK_FRAMES);
-  return tap;
-}
 
 /** Both outputs exactly zero in tap blocks rendered after the mute ramp. */
 async function expectSilentOutputs(page: Page, liveReference: boolean): Promise<void> {

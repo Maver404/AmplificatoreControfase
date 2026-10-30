@@ -1,17 +1,20 @@
 /**
  * Step 7 — A/B verification: the only place where the guided setup un-mutes the anti-noise (with
  * the 1.5 s soft-start), after every safety condition holds. Live attenuation with the error mic,
- * broadband and per third-octave band (normalised by the reference of each state), bypass toggling
- * (B), the controller's "ANC sta aumentando il rumore" guard, save as preset.
+ * broadband and per third-octave band (normalised by the reference of each state) and, in tonal
+ * mode, at each harmonic h·f0 (the tone's own bins, next to the calibrated values' prediction or
+ * autotune measurement; a prediction at its model's ceiling worded as that limit, logic.ts ceilingText),
+ * bypass toggling (B), the controller's "ANC sta aumentando il rumore" guard, save as preset.
  */
 import type { ControllerEvent, ControllerState } from '../../app/controller.ts';
 import { defaultSweepBand } from '../../audio/calibration.ts';
+import { harmonicAttenuationDb } from '../../app/spectrum.ts';
 import { bandAttenuationDb, thirdOctaveCenters, thirdOctaveLabel } from '../spectrum-view.ts';
-import { formatSigned } from '../units.ts';
+import { bankHarmonics, formatSigned } from '../units.ts';
 import { button, el, liveNote, note, setListItems, setText, uid } from './dom.ts';
 import type { StepEnv, StepView } from './env.ts';
 import { errorMicOn, LOCK_TEXT, unmuteBlockers } from './flow.ts';
-import { defaultPresetName, fmtDb, howlAlarmText } from './logic.ts';
+import { defaultPresetName, expectedHarmonic, fmtDb, harmonicMeasuredText, howlAlarmText } from './logic.ts';
 
 /** The band list is rewritten at most this often (it is a polite live region). */
 const BANDS_EVERY_MS = 1500;
@@ -29,6 +32,7 @@ export function createVerifyStep(env: StepEnv): StepView {
 
   // Per-band attenuation, normalised by the controller's reference spectrum of each ANC state.
   let bandTexts: string[] = [];
+  let harmTexts: string[] = [];
   let bandsAt = 0;
   const offSpectra = controller.subscribe((s, change) => {
     if (change !== 'spectrum') return;
@@ -41,6 +45,15 @@ export function createVerifyStep(env: StepEnv): StepView {
       const a = bandAttenuationDb({ errOff: sp.errBypass, refOff: sp.refOff, errOn: sp.err, refOn: sp.refOn }, sp.fs, sp.fftSize, fc);
       return a === null ? [] : [`${thirdOctaveLabel(fc)}: ${formatSigned(a, 1)} dB`];
     });
+    // Tonal mode: the anti-noise only plays the harmonics, so each is measured on its own bins.
+    const p = s.params;
+    const measured = p.phaseMode === 'tonal' ? harmonicAttenuationDb(sp, p.tonal.f0, p.tonal.harmonics) : [];
+    harmTexts =
+      p.phaseMode === 'tonal' && sp.fs > 0
+        ? bankHarmonics(p.tonal.harmonics, p.tonal.f0, sp.fs).map((h) =>
+            harmonicMeasuredText(h, h * p.tonal.f0, measured[h - 1] ?? null, expectedHarmonic(s, data.solution, h)),
+          )
+        : [];
     env.refresh();
   });
 
@@ -65,6 +78,14 @@ export function createVerifyStep(env: StepEnv): StepView {
     'fp-help',
     'Per ogni banda: (errore − riferimento) in bypass meno (errore − riferimento) ad anti-rumore acceso; positivo = più silenzio. ' +
       'Servono alcuni secondi in ciascuno dei due stati (alterna con B).',
+  );
+  const harmTitle = el('h4', 'wz-sub', 'Attenuazione per armonica');
+  const harmList = el('ul', 'wz-list wz-harmonics');
+  const harmHelp = el(
+    'p',
+    'fp-help',
+    'Modalità tonale: la stessa misura solo sulle righe dello spettro alle armoniche di f0, dove agisce l’anti-rumore; ' +
+      'tra parentesi la previsione del passo 6 (o la misura dell’autotune).',
   );
   const alarmNote = liveNote();
 
@@ -104,6 +125,9 @@ export function createVerifyStep(env: StepEnv): StepView {
     bandsTitle,
     bands,
     bandsHelp,
+    harmTitle,
+    harmList,
+    harmHelp,
     alarmNote.root,
     note(
       'info',
@@ -153,6 +177,9 @@ export function createVerifyStep(env: StepEnv): StepView {
       const showBands = errorMicOn(s) && s.ch2 === 'ok';
       bandsTitle.hidden = bandsHelp.hidden = !showBands;
       setListItems(bands, showBands ? bandTexts : []);
+      const showHarm = showBands && s.params.phaseMode === 'tonal' && harmTexts.length > 0;
+      harmTitle.hidden = harmHelp.hidden = !showHarm;
+      setListItems(harmList, showHarm ? harmTexts : []);
       if (alarm) alarmNote.set('error', alarm);
       else alarmNote.clear();
 

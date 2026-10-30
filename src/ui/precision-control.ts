@@ -68,6 +68,7 @@ export interface PrecisionControlPatch {
   max?: number;
   units?: readonly UnitOption[];
   resetValue?: number | null;
+  resetLabel?: string;
   disabled?: boolean;
 }
 
@@ -99,6 +100,7 @@ export function createPrecisionControl(container: HTMLElement, opts: PrecisionCo
   let units: UnitOption[] = opts.units ? [...opts.units] : [];
   let unitId: string | null = opts.unitId ?? units[0]?.id ?? null;
   let resetValue: number | null = opts.resetValue ?? null;
+  let resetLabel = opts.resetLabel ?? 'valore di riferimento';
   let label = opts.label;
   let disabled = !!opts.disabled;
   /** The user has typed in the numeric field since the last commit: external updates must not overwrite it. */
@@ -209,10 +211,9 @@ export function createPrecisionControl(container: HTMLElement, opts: PrecisionCo
     const hasReset = resetValue !== null && Number.isFinite(resetValue);
     resetBtn.hidden = !hasReset;
     if (hasReset) {
-      const what = opts.resetLabel ?? 'valore di riferimento';
       const r = `${displayText(resetValue as number)}${ul ? ` ${ul}` : ''}`;
-      resetBtn.setAttribute('aria-label', `Ripristina ${label}: ${what} (${r})`);
-      resetBtn.title = `Doppio click sul nome o ↺: ${what} (${r})`;
+      resetBtn.setAttribute('aria-label', `Ripristina ${label}: ${resetLabel} (${r})`);
+      resetBtn.title = `Doppio click sul nome o ↺: ${resetLabel} (${r})`;
     }
     const desc = opts.describe?.(value, currentUnit()) ?? '';
     if (hint.textContent !== desc) hint.textContent = desc;
@@ -405,6 +406,7 @@ export function createPrecisionControl(container: HTMLElement, opts: PrecisionCo
           renderUnits();
         }
         if (patch.resetValue !== undefined) resetValue = patch.resetValue;
+        if (patch.resetLabel !== undefined) resetLabel = patch.resetLabel;
         if (patch.disabled !== undefined) disabled = patch.disabled;
         if (disabled) stopAll();
       }

@@ -1,7 +1,19 @@
 import { describe, expect, it } from 'vitest';
-import { Biquad, lowpass } from '../../src/dsp/biquad.ts';
-import { HOWL_LONG_LOOP_MAX_MS, HOWL_PERIODIC_RHO, HOWL_SAT_GR_DB, HowlDetector, PeriodicityAnalyzer } from '../../src/dsp/howl-detector.ts';
+import { Biquad, biquadResponse, highpass, lowpass } from '../../src/dsp/biquad.ts';
+import type { BiquadCoeffs } from '../../src/dsp/biquad.ts';
+import { cAbs } from '../../src/dsp/complex.ts';
+import {
+  HOWL_LONG_LOOP_MAX_MS,
+  HOWL_NARROW_BAND_HZ,
+  HOWL_PERIODIC_RHO,
+  HOWL_SAT_GR_DB,
+  HOWL_WIDE_BAND_HZ,
+  HowlDetector,
+  PeriodicityAnalyzer,
+  howlBandHz,
+} from '../../src/dsp/howl-detector.ts';
 import { PeakLimiter } from '../../src/dsp/limiter.ts';
+import { clampParams } from '../../src/dsp/params.ts';
 import { mulberry32 } from '../../src/dsp/sweep.ts';
 
 const RATES = [44100, 48000, 96000] as const;
@@ -593,3 +605,319 @@ describe('HowlDetector: loud legitimate signals held by the limiter', () => {
     expect(det.state.triggered).toBe(false);
   });
 });
+
+describe('HowlDetector: the periodicity analysis follows the chain band', () => {
+  it('howlBandHz: the LP cutoff, the top tonal band, or unbounded', () => {
+    const p = clampParams(undefined);
+    expect(howlBandHz(p)).toBe(p.filters.lpFreq);
+    p.filters.lpFreq = 4000;
+    expect(howlBandHz(p)).toBe(4000);
+    p.filters.lpEnabled = false;
+    expect(howlBandHz(p)).toBe(Infinity);
+    p.phaseMode = 'tonal';
+    p.tonal = { f0: 400, harmonics: 8, q: 10 };
+    expect(howlBandHz(p)).toBeCloseTo(3200 * 1.05, 9);
+    p.tonal = { f0: 100, harmonics: 4, q: 30 };
+    expect(howlBandHz(p)).toBeCloseTo(400 * (1 + 1 / 60), 9);
+    p.filters.lpEnabled = true;
+    p.filters.lpFreq = 300;
+    expect(howlBandHz(p)).toBe(300);
+    // HP and barrier shape the low end only.
+    p.filters.lpEnabled = false;
+    p.phaseMode = 'delay';
+    p.filters.barrierEnabled = true;
+    expect(howlBandHz(p)).toBe(Infinity);
+  });
+
+  it('setBandHz: ~12 kHz above HOWL_WIDE_BAND_HZ, ~6 kHz again at or below HOWL_NARROW_BAND_HZ; reset() keeps it', () => {
+    const det = new HowlDetector(48000);
+    expect(det.wideBand).toBe(false);
+    det.setBandHz(HOWL_WIDE_BAND_HZ);
+    expect(det.wideBand).toBe(false);
+    det.setBandHz(HOWL_WIDE_BAND_HZ + 1);
+    expect(det.wideBand).toBe(true);
+    det.setBandHz(HOWL_NARROW_BAND_HZ + 1);
+    expect(det.wideBand).toBe(true);
+    det.reset();
+    expect(det.wideBand).toBe(true);
+    det.setBandHz(HOWL_NARROW_BAND_HZ);
+    expect(det.wideBand).toBe(false);
+    det.setBandHz(HOWL_WIDE_BAND_HZ - 1);
+    expect(det.wideBand).toBe(false);
+    det.setBandHz(Number.NaN);
+    expect(det.wideBand).toBe(true);
+    det.setBandHz(500);
+    det.setBandHz(Infinity);
+    expect(det.wideBand).toBe(true);
+    // At 8 kHz the main analysis already runs at the decimated rate: nothing to switch.
+    const low = new HowlDetector(8000);
+    low.setBandHz(4000);
+    expect(low.wideBand).toBe(false);
+  });
+
+  /** Unit Gaussian noise through `f` (a fresh filter per call), as a generator, and its RMS from a pilot run. */
+  function filtered(fs: number, coeffs: BiquadCoeffs[], seed: number): { next: () => number; rms: number } {
+    const mk = (s: number): (() => number) => {
+      const fl = coeffs.map((c) => new Biquad(c));
+      const g = gaussian(s);
+      return () => fl.reduce((v, b) => b.process(v), g());
+    };
+    const pilot = mk(seed + 1000);
+    let e = 0;
+    for (let i = 0; i < fs; i++) e += pilot() ** 2;
+    return { next: mk(seed), rms: Math.sqrt(e / fs) };
+  }
+
+  /**
+   * The chain in miniature with a speaker → reference path that passes only 2.7–4.3 kHz (4th-order band-pass,
+   * loop gain g at its peak, ~3.4 kHz): v = BP(ambient + gain·y[n − D]) + lf, y = limiter(v), the ambient
+   * 28 dB below the ceiling. `lf` is low-pass noise (500 Hz) `lfDb` re the ceiling: what the amplifier plays
+   * below the howl, which dilutes it in the ~6 kHz analysis (that sees the howl only through its 2.4 kHz
+   * anti-alias filter). `switchTo`: setBandHz at that time (s from the start; the loop closes at 0.5 s).
+   */
+  function bandLoop(
+    fs: number,
+    bandHz: number,
+    o: { loopMs: number; g: number; lfDb: number; seconds: number; switchTo?: [atS: number, bandHz: number] },
+  ) {
+    const ceilingDb = -12;
+    const ceil = Math.pow(10, ceilingDb / 20);
+    const det = new HowlDetector(fs);
+    det.setBandHz(bandHz);
+    const lim = new PeakLimiter(fs, ceilingDb);
+    const cs = [highpass(fs, 2700, Math.SQRT1_2), highpass(fs, 2700, Math.SQRT1_2), lowpass(fs, 4300, Math.SQRT1_2), lowpass(fs, 4300, Math.SQRT1_2)];
+    let peak = 0;
+    for (let f = 2000; f < 5000; f += 5) peak = Math.max(peak, cs.reduce((a, c) => a * cAbs(biquadResponse(c, f, fs)), 1));
+    const bp = cs.map((c) => new Biquad(c));
+    const lf = filtered(fs, [lowpass(fs, 500, Math.SQRT1_2)], 31);
+    const lfGain = (ceil * Math.pow(10, o.lfDb / 20)) / lf.rms;
+    const e = gaussian(32);
+    const amb = ceil * Math.pow(10, -28 / 20);
+    const d = Math.round((o.loopMs / 1000) * fs);
+    const closeAt = Math.round(0.5 * fs);
+    const n = Math.round(o.seconds * fs);
+    const y = new Float64Array(n);
+    const w = Math.round(0.2 * fs);
+    const busy = new Uint8Array(n);
+    let count = 0;
+    let limitedAt: number | null = null;
+    let maxOut = 0;
+    const switchAt = o.switchTo === undefined ? -1 : Math.round(o.switchTo[0] * fs);
+    for (let i = 0; i < n; i++) {
+      if (i === switchAt) det.setBandHz(o.switchTo![1]);
+      let h = amb * e() + (i >= closeAt ? (o.g / peak) * y[i - d] : 0);
+      for (const b of bp) h = b.process(h);
+      const v = h + lfGain * lf.next();
+      const gr = lim.gainReductionDb;
+      det.push(v, 0, gr, ceilingDb);
+      y[i] = lim.process(v);
+      maxOut = Math.max(maxOut, Math.abs(y[i]));
+      busy[i] = gr > 0.5 ? 1 : 0;
+      count += busy[i] - (i >= w ? busy[i - w] : 0);
+      if (limitedAt === null && i >= closeAt + w && count >= 0.8 * w) limitedAt = (i - w - closeAt) / fs;
+      if (det.state.triggered) return { at: (i - closeAt) / fs, reason: det.state.reason, freqHz: det.state.freqHz, limitedAt, maxOut, ceil };
+    }
+    return { at: null, reason: null, freqHz: null, limitedAt, maxOut, ceil };
+  }
+
+  for (const fs of RATES) {
+    for (const [loopMs, g] of [
+      [50, 1.3],
+      [100, 1.2],
+      [200, 1.15],
+    ] as const) {
+      it(`a dense-comb howl at 2.7–4.3 kHz (${loopMs} ms, gain ${g}) under low-frequency noise: pinned at ~6 kHz, caught at ~12 kHz (${fs} Hz)`, () => {
+        const seconds = loopMs === 200 ? 7 : 3.5;
+        const wide = bandLoop(fs, 4000, { loopMs, g, lfDb: -22, seconds });
+        // While it grows, or within 400 ms of sustained limiting.
+        expect(['peak-growth', 'limiter-saturated']).toContain(wide.reason);
+        if (wide.limitedAt !== null) expect(wide.at! - wide.limitedAt).toBeLessThanOrEqual(0.4);
+        expect(wide.freqHz!).toBeGreaterThan(2400);
+        expect(wide.maxOut).toBeLessThanOrEqual(wide.ceil);
+        // The same howl with the main analysis at ~6 kHz (a chain up to 500 Hz would not pass it at all).
+        const narrow = bandLoop(fs, 500, { loopMs, g, lfDb: -22, seconds });
+        expect(narrow.limitedAt).not.toBeNull();
+        expect(narrow.at).toBeNull();
+      });
+    }
+  }
+
+  it('a change of rate starts the main analysis over: widened while the howl is pinned, it is caught ~0.2–0.6 s later', () => {
+    // The 100 ms howl above, pinned at the ceiling at ~6 kHz; the chain is widened 3.5 s after closing the loop.
+    const r = bandLoop(48000, 500, { loopMs: 100, g: 1.2, lfDb: -22, seconds: 5, switchTo: [4, 4000] });
+    expect(r.limitedAt!).toBeLessThan(3);
+    expect(r.reason).toBe('limiter-saturated');
+    // Not before the first analysis at the new rate (200 ms of history, done within 60 ms).
+    expect(r.at! - 3.5).toBeGreaterThan(0.2);
+    expect(r.at! - 3.5).toBeLessThan(0.6);
+  });
+
+  it('after a change of rate the band-level growth rule waits for the second analysis (noise fading in over a tone)', () => {
+    // The 'not falling' test compares two analyses of the same signal path: right after a switch the first
+    // analysis has no predecessor, and a tone that keeps |ρ| above 0.3 while broadband noise fades in would
+    // pass it (8 of these 8 runs triggered 'peak-growth' without the wait).
+    const fs = 48000;
+    const ceilingDb = -12;
+    const ceil = Math.pow(10, ceilingDb / 20);
+    for (const cutHz of [500, 3000]) {
+      for (const seed of [15, 18]) {
+        for (const switchS of [2, 2.1]) {
+          const det = new HowlDetector(fs);
+          const lim = new PeakLimiter(fs, ceilingDb);
+          const noise = filtered(fs, [lowpass(fs, 1.272 * cutHz, 1 / Math.sqrt(3))], seed);
+          const k = (ceil * Math.pow(10, -10 / 20)) / noise.rms;
+          let wide = cutHz > HOWL_WIDE_BAND_HZ;
+          det.setBandHz(wide ? cutHz : 500);
+          for (let i = 0; i < 5 * fs && !det.state.triggered; i++) {
+            const t = i / fs;
+            if (i === Math.round(switchS * fs)) {
+              wide = !wide;
+              det.setBandHz(wide ? 4000 : 500);
+            }
+            // Tone 25 dB below the ceiling; noise fading in over 1 s from t = 2 s up to 10 dB below it.
+            const fade = Math.max(Math.pow(10, -25 / 20), Math.min(1, t - 2));
+            const v = ceil * Math.pow(10, -25 / 20) * Math.sin(2 * Math.PI * 120 * t) + fade * k * noise.next();
+            det.push(v, -10, lim.gainReductionDb, ceilingDb);
+            lim.process(v);
+          }
+          expect(det.state.triggered).toBe(false);
+        }
+      }
+    }
+  });
+});
+
+describe('PeriodicityAnalyzer: envelope (the ~12 kHz analysis)', () => {
+  /** x[n] = BP(e[n]) + g·x[n − d] at `rate`, BP = 2.7–4.3 kHz (4th order), then every `keep`-th sample. */
+  function bandComb(rate: number, n: number, d: number, g: number, seed: number, keep = 1): Float64Array {
+    const bp = [highpass(rate, 2700, Math.SQRT1_2), highpass(rate, 2700, Math.SQRT1_2), lowpass(rate, 4300, Math.SQRT1_2), lowpass(rate, 4300, Math.SQRT1_2)].map(
+      (c) => new Biquad(c),
+    );
+    const e = gaussian(seed);
+    const x = new Float64Array(n * keep);
+    for (let i = 0; i < x.length; i++) x[i] = bp.reduce((v, b) => b.process(v), e()) + (i >= d ? g * x[i - d] : 0);
+    return Float64Array.from({ length: n }, (_, i) => x[i * keep]);
+  }
+
+  it('a band-pass howl whose loop delay falls between two lags: |ρ| loses cos(π·f/rate), the envelope does not', () => {
+    // A 3.4 kHz comb (gain 0.9) with a 600.5-sample loop at 12 kHz (made at 24 kHz, 1201 samples), lags up to
+    // 80 ms (the loop once).
+    const rate = 12000;
+    const o = { log2N: 13, lagMaxMs: 80 };
+    const plain = new PeriodicityAnalyzer(rate, 200, o);
+    const env = new PeriodicityAnalyzer(rate, 200, { ...o, envelope: true });
+    expect(env.envelope).toBe(true);
+    expect(plain.envelope).toBe(false);
+    const x = bandComb(2 * rate, plain.everySamples * 12, 1201, 0.9, 41, 2);
+    for (const v of x) {
+      plain.push(v);
+      env.push(v);
+    }
+    expect(env.rho).toBeGreaterThan(0.85);
+    expect(Math.abs(env.lagMs - 50.04)).toBeLessThan(0.1);
+    expect(plain.rho).toBeLessThan(env.rho - 0.15);
+    expect(env.analyses).toBe(plain.analyses);
+    expect(env.analyses).toBeGreaterThan(5);
+    env.reset();
+    expect(env.analyses).toBe(0);
+  });
+
+  it('matches a direct evaluation (analytic correlation, held to the share of the window with lagged samples)', () => {
+    const rate = 1000;
+    const pa = new PeriodicityAnalyzer(rate, 100, { log2N: 10, lagMinMs: 20, lagMaxMs: 200, envelope: true });
+    const N = 1024;
+    const W = pa.windowSamples;
+    const g = gaussian(43);
+    const f = new Biquad(lowpass(rate, 150, Math.SQRT1_2));
+    const xs: number[] = [];
+    let last = Infinity;
+    let checked = 0;
+    for (let i = 0; i < 2500; i++) {
+      const v = f.process(g()) + (i >= 137 ? 0.6 * xs[i - 137] : 0);
+      xs.push(v);
+      pa.push(v);
+      if (pa.ageMs < last) {
+        // The analysed window ended with the sample pushed ageMs − 1 sample ago.
+        const end = xs.length + 1 - Math.round((pa.ageMs * rate) / 1000);
+        const b = new Float64Array(N);
+        for (let k = 0; k < N; k++) b[k] = end - N + k >= 0 ? xs[end - N + k] : 0;
+        const a = Float64Array.from(b, (v2, k) => (k >= N - W ? v2 : 0));
+        const c = new Float64Array(N);
+        for (let tau = 0; tau < N; tau++) for (let k = N - W; k < N; k++) c[tau] += a[k] * b[(k - tau + N) % N];
+        // Analytic signal of c: 2× the positive frequencies, none of the negative ones.
+        const cr = new Float64Array(N);
+        const ci = new Float64Array(N);
+        for (let k = 0; k <= N / 2; k++) {
+          let re = 0;
+          let im = 0;
+          for (let t = 0; t < N; t++) {
+            re += c[t] * Math.cos((2 * Math.PI * k * t) / N);
+            im -= c[t] * Math.sin((2 * Math.PI * k * t) / N);
+          }
+          const w = k === 0 || k === N / 2 ? 1 : 2;
+          for (let t = 0; t < N; t++) {
+            const ph = (2 * Math.PI * k * t) / N;
+            cr[t] += (w * (re * Math.cos(ph) - im * Math.sin(ph))) / N;
+            ci[t] += (w * (re * Math.sin(ph) + im * Math.cos(ph))) / N;
+          }
+        }
+        const energy = (from: number, to: number): number => {
+          let e = 0;
+          for (let k = Math.max(0, from); k < to; k++) e += b[k] * b[k];
+          return e;
+        };
+        const firstValid = Math.max(0, N - end);
+        const ea = energy(N - W, N);
+        let best = 0;
+        let r1 = 0;
+        let r2 = 0;
+        for (let tau = pa.lagMinSamples - 1; tau <= pa.lagMaxSamples + 1; tau++) {
+          const eb = energy(N - W - tau, N - tau);
+          const share = energy(Math.max(N - W, firstValid + tau), N) / ea;
+          const r = Math.min(Math.hypot(cr[tau], ci[tau]) / Math.sqrt(ea * eb), Math.sqrt(share));
+          if (tau - 1 >= pa.lagMinSamples && r1 >= r2 && r1 > r && r1 > best) best = r1;
+          r2 = r1;
+          r1 = r;
+        }
+        expect(pa.rho).toBeCloseTo(best, 9);
+        checked++;
+      }
+      last = pa.ageMs;
+    }
+    // Analyses of a history still filling up (the share bound acting) and of a full one.
+    expect(checked).toBeGreaterThan(15);
+  });
+
+  it('noise right after a reset (a history still filling up) stays far from periodic', () => {
+    const rate = 12000;
+    for (let seed = 1; seed <= 12; seed++) {
+      const pa = new PeriodicityAnalyzer(rate, 200, { log2N: 14, envelope: true });
+      const g = gaussian(seed);
+      const f = new Biquad(lowpass(rate, 500, Math.SQRT1_2));
+      let last = Infinity;
+      for (let i = 0; i < 1.5 * rate; i++) {
+        pa.push(f.process(g()));
+        if (pa.ageMs < last) expect(pa.rho).toBeLessThan(0.3);
+        last = pa.ageMs;
+      }
+      expect(pa.analyses).toBe(7);
+    }
+  });
+
+  it('the ~12 kHz configuration: 5–600 ms over the same ~0.77 s window, its work spread over ≤ 60 ms', () => {
+    const rate = 12000;
+    const pa = new PeriodicityAnalyzer(rate, 200, { log2N: 14, envelope: true });
+    expect(pa.lagMaxSamples).toBe(7200);
+    expect(pa.windowSamples).toBe(16384 - 7200 - 2);
+    const units = 16384 + 14 * 16384 + 2 * 8193 + (pa.lagMaxSamples - pa.lagMinSamples + 3);
+    expect(pa.budget * Math.ceil(0.06 * rate)).toBeGreaterThanOrEqual(units);
+    expect(pa.budget).toBeLessThan(400);
+    const x = bandComb(rate, pa.everySamples * 10, 1777, 0.95, 44);
+    for (const v of x) pa.push(v);
+    for (let i = 0; i < Math.ceil(0.06 * rate) + 1; i++) pa.push(0);
+    expect(pa.ageMs).toBeLessThanOrEqual(61);
+    expect(pa.rho).toBeGreaterThan(HOWL_PERIODIC_RHO);
+    expect(pa.lagMs).toBeCloseTo((1777 / rate) * 1000, 6);
+  });
+});
+

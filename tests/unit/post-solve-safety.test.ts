@@ -295,6 +295,23 @@ describe('a shorter neutraliser or a loaded preset keeps the loop-gain margin (v
     expect(c.state.presets.message?.text).not.toMatch(/ridotti/);
   });
 
+  it('the per-harmonic attenuation that came with the lowered gains is dropped (R-L1)', async () => {
+    const { cal, p } = roomCase();
+    const { c } = await controller();
+    c.setFeedbackTaps(1024);
+    c.setCalibration(JSON.parse(JSON.stringify(cal)) as unknown);
+    c.applyParams(p, { calibrated: true, harmonics: [{ h: 1, freqHz: 100, attenuationDb: 24, source: 'measured' }] });
+    expect(c.state.calibratedHarmonics).toHaveLength(1);
+    c.setFeedbackTaps(128);
+    expect(c.state.params.channels[0].gainDb).toBeLessThan(p.channels[0].gainDb - 1);
+    // 24 dB was measured with gains ≈ 12 dB higher: step 7 must not expect it.
+    expect(c.state.calibratedHarmonics).toBeNull();
+    // Without a reduction it stays.
+    c.applyParams(c.currentParams, { calibrated: true, harmonics: [{ h: 1, freqHz: 100, attenuationDb: 9, source: 'measured' }] });
+    c.setFeedbackTaps(1024);
+    expect(c.state.calibratedHarmonics).toHaveLength(1);
+  });
+
   it('a gain within the margin for the new length is left alone', async () => {
     const { cal, p } = roomCase();
     const { c } = await controller();

@@ -323,7 +323,7 @@ function howItWorks(): HTMLDetailsElement {
       [strong('Condizionamento: '), 'blocco della continua, passa-alto di protezione (vento e rombo, ' +
         'default 20 Hz), compensazione barriera opzionale (parete/finestra), passa-basso Bessel (default 500 Hz).'],
       [strong('Solo in modalità tonale: '), 'un banco di risonatori sulle armoniche di f0 riproduce solo il ' +
-        'tono, non il rumore a banda larga.'],
+        'tono, non il rumore a banda larga; ogni uscita può correggere guadagno e fase di ciascuna armonica.'],
       [strong('Per ogni uscita L/R: '), 'ritardo frazionario (precisione sotto il campione), polarità, ' +
         'guadagno, Δ di fase, muto e avvio graduale.'],
       [strong('Uscita: '), 'volume master e limitatore con tetto (ceiling) in dBFS; il rilevatore di ' +
@@ -338,10 +338,22 @@ function howItWorks(): HTMLDetailsElement {
       [strong('Tonale'), 'Rumori periodici stabili: motori, compressori, trasformatori (l\'app la ' +
         'suggerisce quando rileva un tono dominante).',
       'Il ritardo si avvolge su periodi interi 1/f0, quindi funziona anche se il rumore arriva ' +
-        '"in ritardo"; f0 viene stimata e inseguita.'],
+        '"in ritardo"; f0 viene stimata e inseguita. All\'armonica h Δ vale h·Δ, più la correzione ' +
+        'di quell\'armonica.'],
       [strong('Hilbert (avanzata)'), 'Ottimizzazione con il mic d\'errore e la regolazione automatica.',
         'Rotazione di fase a larga banda; aggiunge ritardo di gruppo (≈ 2,6 ms a 100 Hz).'],
     ]),
+    p(strong('Correzioni per armonica (solo modalità tonale). '), 'Un unico ritardo sposta la fase di ogni ' +
+      'armonica h di h·Δ: basta solo se filtri, casse e stanza non aggiungono altro, e di solito non è così ' +
+      '(per esempio la fondamentale si cancella e la 4ª armonica molto meno). Per questo ogni uscita ha, per ' +
+      'ogni armonica, una correzione di guadagno (−30…+6 dB) e di fase (−180…+180°, positivo = ritardo) che ' +
+      'si aggiunge al ritardo: fase totale all\'armonica h = polarità + h·Δ + θ_h. Le calcola il passo 6 ' +
+      'della configurazione guidata insieme a ritardo, guadagno e polarità, e vengono applicate con la soluzione; ' +
+      'con il mic d\'errore l\'autotune del passo 6 le affina misurando ogni armonica. ' +
+      'Le vedi e le ritocchi nella sezione «Armoniche» di ogni canale (doppio clic sul nome = valore calibrato, ' +
+      '«Azzera armoniche» = nessuna correzione; con «Collega L/R» azzera entrambi i canali). Come per i guadagni, ' +
+      'un aumento di oltre 6 dB sale a 6 dB al secondo (da −30 a +6 dB servono 5–6 s), e il limite vale per ' +
+      'guadagno, master e correzione insieme. Nell\'oscilloscopio la traccia attesa non le include.'),
     p('Il ', strong('mic d\'errore'), ' (facoltativo, ingresso 2, o 1 se il riferimento è sul 2) sta nella zona: misura l\'attenuazione ' +
       'reale (confronto A/B con il bypass) e permette la regolazione automatica. Senza, l\'app usa la ' +
       'geometria e una calibrazione a due posizioni con l\'unico microfono, ma il risultato non è misurabile.'),

@@ -58,12 +58,18 @@ export function createCheckStep(env: StepEnv): StepView {
     if (cal === null || s.fs === null || cal.fs !== s.fs || !s.armed || s.panic) return;
     const op = env.startOp('Controllo rapido delle casse');
     running = true;
-    const chans = activeChannels(s.speakers);
+    const start = controller.currentParams;
     data.check = { key: ampKey(s), channels: [null, null], acceptUnverified: false };
+    // A speaker the saved solution keeps off (separate zones: its zone gave nothing useful) plays nothing: its values
+    // are not the anti-noise's, and no change of its path matters.
+    const chans = activeChannels(s.speakers).filter((ch) => {
+      if (start.channels[ch].enabled) return true;
+      data.check!.channels[ch] = { state: 'ok', text: 'Cassa spenta nella calibrazione salvata: non usata, nessun controllo.' };
+      return false;
+    });
     done = 0;
     total = chans.length * (QUICK_REPETITIONS + 1);
     const next: CalibrationData = JSON.parse(JSON.stringify(cal)) as CalibrationData;
-    const start = controller.currentParams;
     const channels: [ChannelParams, ChannelParams] = [{ ...start.channels[0] }, { ...start.channels[1] }];
     let corrected = false;
     try {

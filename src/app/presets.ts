@@ -95,7 +95,8 @@ function cleanName(s: string): string {
 /**
  * Validates an untrusted preset: rejects non-objects and entries without a valid id, name or params
  * object; strips unknown keys; clamps every parameter with clampParams and forces gainUnlocked=false
- * (so channel gains above 0 dB come back at 0 dB); keeps `calibration` only if it is a plain JSON
+ * (so channel gains above 0 dB come back at 0 dB; harmonic trims are clamped, and presets saved before
+ * they existed load with every trim at 0); keeps `calibration` only if it is a plain JSON
  * object (deep-copied). Invalid metadata falls back to neutral values (sampleRate 0 = unknown).
  */
 export function sanitizePreset(raw: unknown): Preset | null {

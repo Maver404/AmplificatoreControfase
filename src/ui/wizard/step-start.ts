@@ -33,9 +33,11 @@ export function createStartStep(env: StepEnv): StepView {
     // A previous answer may have loaded the saved solution: each answer starts from clean measurements.
     resetMeasurements(data);
     if (mode !== 'full' && pick) {
-      // Loaded while the output is silent: values only, then the steps take it from there.
-      controller.loadPreset(pick.preset.id);
+      // Loaded while the output is silent: values only, then the steps take it from there. The speakers first: with
+      // separate zones setSpeakers switches channel R on, and a saved solution may keep a speaker off (its zone gave
+      // nothing useful); loading after it keeps the preset's channels, and loadPreset's loop check is of what plays.
       controller.setSpeakers(pick.calibration.speakers);
+      controller.loadPreset(pick.preset.id);
       data.presetId = pick.preset.id;
       data.reuse = {
         presetId: pick.preset.id,

@@ -13,7 +13,13 @@
  *      1.3–1.5: muted within two trips around the loop of sustained limiting (a long loop's howl is held
  *      unevenly at first: only the loudest part of each trip reaches the ceiling);
  *  (c) the output never exceeds the ceiling;
- * and no trigger in 10 s of legitimate signals, some of them held at the ceiling by the limiter.
+ *  (d) a chain wider than ~2 kHz (Bessel LP at 4 kHz, or off) with a speaker → reference path that passes
+ *      only 2.7–4.3 kHz (the loop peaking at ~3.3–3.5 kHz), so that the howl is a dense comb above the ~6 kHz
+ *      periodicity analysis' band, under low-frequency anti-noise: loop gain 1.2 or 1.5, 12.5–200 ms, muted
+ *      within 400 ms of sustained limiting, and within 1.5 s of closing the loop for loop gain 1.5 and loops
+ *      up to 100 ms (the detector analyses a wide chain at ~12 kHz);
+ * and no trigger in 10 s of legitimate signals, some of them held at the ceiling by the limiter, with the
+ * default chain and with wide ones (and while the chain switches between narrow and wide).
  * HOWL_SIM_REPORT=1 prints the measured times.
  */
 import { afterAll, describe, expect, it } from 'vitest';
@@ -45,6 +51,32 @@ function engineParams(gainDb = -10): EngineParams {
   p.channels[1].enabled = false;
   return p;
 }
+
+/** engineParams() with the Bessel LP at `lpHz` (null: off), a chain wider than HOWL_WIDE_BAND_HZ. */
+function wideParams(lpHz: number | null, gainDb = -10): EngineParams {
+  const p = engineParams(gainDb);
+  if (lpHz === null) p.filters.lpEnabled = false;
+  else p.filters.lpFreq = lpHz;
+  return p;
+}
+
+/**
+ * A speaker → reference path that passes only 2.7–4.3 kHz, flat within ~1 dB over 3–3.8 kHz: a 41-tap
+ * band-pass FIR (Hamming-windowed sinc, 0.42 ms of group delay) as arrivals 1/fs apart. With the chain the
+ * loop peaks at ~3.3 kHz (LP 4 kHz) or ~3.5 kHz (LP off); loop gain 1.2 is above 1 at ~2.7–4.0 / 2.9–4.1 kHz
+ * only, 1.5 at ~2.4–4.2 / 2.6–4.4 kHz, and ≤ 0.6 below 2 kHz and above 6 kHz. Flat, so the howl stays a dense
+ * comb (no narrow peak) for a long time.
+ */
+const BAND_PATH: Omit<PathSpec, 'delayS' | 'gain'> = (() => {
+  const m = 41;
+  const h = Array.from({ length: m }, (_, k) => {
+    const t = k - (m - 1) / 2;
+    const sinc = (f: number): number => (t === 0 ? (2 * f) / fs : Math.sin((2 * Math.PI * f * t) / fs) / (Math.PI * t));
+    return (sinc(4300) - sinc(2700)) * (0.54 - 0.46 * Math.cos((2 * Math.PI * k) / (m - 1)));
+  });
+  // The first tap is the main arrival (gain 1): the others relative to it.
+  return { reflections: h.slice(1).map((v, k) => ({ delayS: (k + 1) / fs, gain: v / h[0] })) };
+})();
 
 const ceilingOf = (p: EngineParams): number => dbToLin(p.ceilingDb);
 const commanded = (p: EngineParams): number => dbToLin(p.masterDb + p.channels[0].gainDb);
@@ -102,6 +134,8 @@ interface LoopSpec {
   /** Shape of the speaker → reference path (default: a single arrival). */
   shape?: Omit<PathSpec, 'delayS' | 'gain'>;
   seed?: number;
+  /** Engine parameters (default engineParams()). */
+  params?: EngineParams;
 }
 
 function loopPlant(p: EngineParams, s: LoopSpec): PlantConfig {
@@ -151,7 +185,7 @@ function sustainedGr(gr: number[], db: number): number | null {
 }
 
 function runLoop(s: LoopSpec, maxS: number): LoopOutcome {
-  const p = engineParams();
+  const p = s.params ?? engineParams();
   const gr: number[] = [];
   let closed = false;
   const rig = new SimRig(loopPlant(p, s), {
@@ -294,6 +328,36 @@ describe('howl simulator: (b′) loops longer than 600 ms, muted within two trip
   }
 });
 
+describe('howl simulator: (d) a wide chain and a howl at 3–3.8 kHz, muted within 400 ms of sustained limiting', () => {
+  for (const [chain, lpHz] of [
+    ['LP 4 kHz', 4000],
+    ['LP off', null],
+  ] as const) {
+    const p = wideParams(lpHz);
+    // Anti-noise of a low-frequency source 25 dB below the ceiling, which also seeds the howl band ~50 dB
+    // below it. Below ~2.4 kHz it dilutes the howl, which the ~6 kHz analysis sees only through its
+    // anti-alias filter (−13 dB at 3.4 kHz): analysed there, 11 of these 16 howls stayed pinned at the
+    // ceiling and the other 5 were muted 0.55–4.9 s after sustained limiting.
+    const noise: NoiseSpec = { broadband: { rms: noiseRmsFor(p, -25, 20, 1000), lo: 20, hi: 1000 } };
+    for (const loopGain of [1.2, 1.5]) {
+      for (const loopMs of [12.5, 50, 100, 200]) {
+        it(`${chain}, loop gain ${loopGain}, ${loopMs} ms`, () => {
+          const growthS = 50 / ((20 * Math.log10(loopGain)) / (loopMs / 1000));
+          const o = runLoop({ loopGain, loopMs, noise, shape: BAND_PATH, params: p, seed: 13 }, growthS + 5);
+          report.push(describeLoop(`(d) ${chain}, G ${loopGain}, ${loopMs} ms`, o));
+          expectMutedHowl(o, ceilingOf(p), false);
+          expect(o.ambientDb).toBeGreaterThan(-28);
+          expect(o.ambientDb).toBeLessThan(-22);
+          expect(o.freqHz!).toBeGreaterThan(2400);
+          if (o.lim05S !== null) expect(o.eventS! - o.lim05S).toBeLessThanOrEqual(0.4);
+          if (o.lim3S !== null) expect(o.eventS! - o.lim3S).toBeLessThanOrEqual(0.4);
+          if (loopGain === 1.5 && loopMs <= 100) expect(o.eventS!).toBeLessThanOrEqual(1.5);
+        }, 30000);
+      }
+    }
+  }
+});
+
 /** Plant time (s) at which the 10 s of expectQuiet() begin; source envelopes are written against it. */
 let quietStart = Infinity;
 
@@ -301,6 +365,10 @@ interface QuietSpec {
   noise: NoiseSpec;
   /** Stable loop gain (0 = no speaker → reference path). */
   loopGain?: number;
+  /** Shape of that path (default: a single arrival). */
+  shape?: Omit<PathSpec, 'delayS' | 'gain'>;
+  /** Bessel LP of the chain (null: off; default: the default 500 Hz). */
+  lpHz?: number | null;
   gainDb?: number;
   /** Arm and record from the first sample (the soft-start included). */
   fromArm?: boolean;
@@ -311,8 +379,8 @@ interface QuietSpec {
 
 /** 10 s of a legitimate signal: no howl event, no auto-mute, never above the ceiling. */
 function expectQuiet(name: string, s: QuietSpec): void {
-  const p = engineParams(s.gainDb ?? -10);
-  const cfg = loopPlant(p, { loopGain: s.loopGain ?? 0, loopMs: 30, noise: s.noise, seed: s.seed ?? 5 });
+  const p = s.lpHz === undefined ? engineParams(s.gainDb ?? -10) : wideParams(s.lpHz, s.gainDb ?? -10);
+  const cfg = loopPlant(p, { loopGain: s.loopGain ?? 0, loopMs: 30, noise: s.noise, shape: s.shape, seed: s.seed ?? 5 });
   let maxGr = 0;
   const rig = new SimRig(cfg, {
     engine: { meterHz: fs / BLOCK },
@@ -511,6 +579,97 @@ describe('howl simulator: no false trigger in 10 s', () => {
           const db = u < 0 ? -20 : u < 1 ? -20 + 20 * u : u < 3 ? 0 : Math.max(-20, -20 * (u - 3));
           return dbToLin(db);
         },
+      },
+    });
+  });
+});
+
+describe('howl simulator: no false trigger in 10 s with a wide chain (periodicity at ~12 kHz)', () => {
+  const p = wideParams(4000);
+  const bb = (relDb: number, lo = 20, hi = 8000) => ({ rms: noiseRmsFor(p, relDb, lo, hi), lo, hi });
+
+  it('broadband noise up to 8 kHz, 20 dB and 8 dB below the ceiling (LP 4 kHz), and 8 dB below with the LP off', () => {
+    expectQuiet('LP 4 kHz, broadband noise −20 dB', { lpHz: 4000, noise: { broadband: bb(-20) } });
+    expectQuiet('LP 4 kHz, broadband noise −8 dB', { lpHz: 4000, noise: { broadband: bb(-8) } });
+    const off = wideParams(null);
+    expectQuiet('LP off, broadband noise −8 dB', { lpHz: null, noise: { broadband: { rms: noiseRmsFor(off, -8, 20, 8000), lo: 20, hi: 8000 } } });
+  });
+
+  it('a 3 kHz tone switching on with a 50 ms ramp, 8 dB below the ceiling (LP 4 kHz)', () => {
+    for (const seed of [5, 8, 11, 23]) {
+      expectQuiet(`LP 4 kHz, 3 kHz tone on in 50 ms (seed ${seed})`, {
+        lpHz: 4000,
+        seed,
+        noise: {
+          broadband: bb(-40),
+          tone: { f0: 3000, amplitudes: [toneAmpFor(p, 3000, -8)] },
+          toneGain: (t) => Math.min(1, Math.max(0, (t - quietStart - 3) / 0.05)),
+        },
+      });
+    }
+  });
+
+  it('speech-like modulated noise, 100–4000 Hz (LP 4 kHz)', () => {
+    const rnd = mulberry32(5);
+    const syl = Array.from({ length: 64 }, () => (rnd() < 0.2 ? 0 : dbToLin(-12 * rnd())));
+    expectQuiet('LP 4 kHz, speech-like modulated noise', {
+      lpHz: 4000,
+      noise: {
+        broadband: bb(-15, 100, 4000),
+        broadbandGain: (t) => {
+          const k = Math.floor(t * 4);
+          const env = Math.sin(Math.PI * (t * 4 - k)) ** 2;
+          return t % 2.5 > 2.1 ? 0 : syl[k % syl.length] * env;
+        },
+      },
+    });
+  });
+
+  it('a stable loop (gain 0.7) on the 2.7–4.3 kHz band path, broadband noise 15 and 8 dB below the ceiling (LP 4 kHz)', () => {
+    for (const relDb of [-15, -8]) {
+      expectQuiet(`LP 4 kHz, stable band-path loop 0.7, noise ${relDb} dB`, { lpHz: 4000, loopGain: 0.7, shape: BAND_PATH, noise: { broadband: bb(relDb) } });
+    }
+  });
+
+  it('broadband noise fading in over a steady 120 Hz tone, and rising smoothly at 20 dB/s (LP 4 kHz)', () => {
+    expectQuiet('LP 4 kHz, noise fade-in over a steady tone', {
+      lpHz: 4000,
+      noise: {
+        broadband: bb(-10),
+        broadbandGain: (t) => Math.max(dbToLin(-25), Math.min(1, t - quietStart - 2)),
+        tone: { f0: 120, amplitudes: [toneAmpFor(p, 120, -25)] },
+      },
+    });
+    expectQuiet('LP 4 kHz, broadband rise 20 dB at 20 dB/s to −10 dB', {
+      lpHz: 4000,
+      noise: {
+        broadband: bb(-10),
+        broadbandGain: (t) => {
+          const u = t - quietStart - 2;
+          return dbToLin(u < 0 ? -20 : u < 1 ? -20 + 20 * u : u < 3 ? 0 : Math.max(-20, -20 * (u - 3)));
+        },
+      },
+    });
+  });
+
+  it('noise fading in over a steady tone while the chain switches between narrow and wide (LP 1 ↔ 4 kHz)', () => {
+    // Every switch restarts the periodicity analysis (and the reconfigure envelope dips the output).
+    let next = 1;
+    let wide = true;
+    expectQuiet('noise fade-in over a tone, LP 1 ↔ 4 kHz every 0.7 s', {
+      lpHz: 4000,
+      noise: {
+        broadband: bb(-10),
+        broadbandGain: (t) => Math.max(dbToLin(-25), Math.min(1, (t - quietStart - 2) / 3)),
+        tone: { f0: 120, amplitudes: [toneAmpFor(p, 120, -25)] },
+      },
+      during: (rig, t) => {
+        if (t < next) return;
+        next += 0.7;
+        wide = !wide;
+        const q = rig.currentParams;
+        q.filters.lpFreq = wide ? 4000 : 1000;
+        rig.send({ type: 'params', params: q });
       },
     });
   });

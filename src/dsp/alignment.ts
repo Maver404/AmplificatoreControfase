@@ -585,6 +585,92 @@ export function solveAlignment(input: AlignmentInput): AlignmentResult {
   return result;
 }
 
+/** Bounds of |T| of harmonicFactors (the trims' gain range as linear amplitudes). */
+export interface FactorBounds {
+  min: number;
+  max: number;
+}
+
+/** A contribution this much below the residual reads as "the channel does not reach this harmonic". */
+const FACTOR_MIN_REACH = 1e-9;
+/** Relative tolerance of the bounds: a factor centred exactly on a bound (rounding) is not a clamp. */
+const FACTOR_BOUND_TOL = 1e-9;
+
+/**
+ * Tonal mode, one harmonic: the complex factors T_ch, multiplying channel ch's current contribution b_ch
+ * (its channel response × secondary path at that frequency), that null the residual p + Σ T_ch·b_ch.
+ *  - 'single' / 'separate', or one usable channel: each channel alone against p, T = −p/b (separate zones:
+ *    each speaker cancels the noise of its own zone);
+ *  - 'shared' with both: the minimum change Σ|T_ch − 1|² that nulls the residual, T_ch = 1 + δ_ch with
+ *    δ_ch = −r·conj(b_ch)/Σ|b|², r = p + Σ b: each speaker corrects in proportion to its own contribution, so
+ *    a harmonic the broadband split already cancels keeps it.
+ * A factor whose magnitude falls outside `bounds` is clamped (phase kept, capped[ch] = true) and, when both
+ * channels share the zone, the other one is re-solved against what remains (then clamped in turn). Entries for
+ * channels that are unused (null b) or do not reach the harmonic (b ≈ 0) are null.
+ */
+export function harmonicFactors(
+  p: Complex,
+  b: [Complex | null, Complex | null],
+  speakers: SpeakerConfig,
+  bounds: FactorBounds,
+): { t: [Complex | null, Complex | null]; capped: [boolean, boolean] } {
+  const t: [Complex | null, Complex | null] = [null, null];
+  const capped: [boolean, boolean] = [false, false];
+  const scale = Math.max(Math.hypot(p.re, p.im), Math.hypot(b[0]?.re ?? 0, b[0]?.im ?? 0), Math.hypot(b[1]?.re ?? 0, b[1]?.im ?? 0));
+  const usable = (v: Complex | null): v is Complex =>
+    v !== null && Number.isFinite(v.re) && Number.isFinite(v.im) && Math.hypot(v.re, v.im) > FACTOR_MIN_REACH * scale;
+  const chans = ([0, 1] as const).filter((ch) => usable(b[ch]) && (speakers !== 'single' || ch === 0));
+  if (chans.length === 0 || !Number.isFinite(p.re) || !Number.isFinite(p.im)) return { t, capped };
+  /** −(target)/v: the factor that makes T·v cancel `target`. */
+  const against = (re: number, im: number, v: Complex): Complex => {
+    const d = v.re * v.re + v.im * v.im;
+    return { re: -(re * v.re + im * v.im) / d, im: -(im * v.re - re * v.im) / d };
+  };
+  const outside = (v: Complex): boolean => {
+    const m = Math.hypot(v.re, v.im);
+    return m > bounds.max * (1 + FACTOR_BOUND_TOL) || m < bounds.min * (1 - FACTOR_BOUND_TOL);
+  };
+  const clampMag = (ch: 0 | 1): void => {
+    const v = t[ch]!;
+    if (!outside(v)) return;
+    const m = Math.hypot(v.re, v.im);
+    const c = Math.min(bounds.max, Math.max(bounds.min, m));
+    capped[ch] = true;
+    t[ch] = m > 0 ? { re: (v.re * c) / m, im: (v.im * c) / m } : { re: c, im: 0 };
+  };
+  if (speakers !== 'shared' || chans.length === 1) {
+    for (const ch of chans) {
+      t[ch] = against(p.re, p.im, b[ch]!);
+      clampMag(ch);
+    }
+    return { t, capped };
+  }
+  const b0 = b[0]!;
+  const b1 = b[1]!;
+  const rRe = p.re + b0.re + b1.re;
+  const rIm = p.im + b0.im + b1.im;
+  const e = b0.re * b0.re + b0.im * b0.im + b1.re * b1.re + b1.im * b1.im;
+  for (const ch of [0, 1] as const) {
+    const v = b[ch]!;
+    // δ = −r·conj(v)/e
+    t[ch] = { re: 1 - (rRe * v.re + rIm * v.im) / e, im: -(rIm * v.re - rRe * v.im) / e };
+  }
+  const o0 = outside(t[0]!);
+  const o1 = outside(t[1]!);
+  if (o0 !== o1) {
+    // Clamp the one outside, re-solve the other against p plus the clamped contribution.
+    const c: 0 | 1 = o0 ? 0 : 1;
+    const o: 0 | 1 = c === 0 ? 1 : 0;
+    clampMag(c);
+    const tc = t[c]!;
+    const bc = b[c]!;
+    t[o] = against(p.re + tc.re * bc.re - tc.im * bc.im, p.im + tc.re * bc.im + tc.im * bc.re, b[o]!);
+  }
+  clampMag(0);
+  clampMag(1);
+  return { t, capped };
+}
+
 /**
  * Weighted residual in dB (negative = attenuation) for given channel settings, with the same grid
  * and speaker semantics as solveAlignment ('separate': worst channel alone against P).

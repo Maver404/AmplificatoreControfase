@@ -27,7 +27,7 @@ import {
   unmuteBlockers,
 } from './flow.ts';
 import type { FlowMode, StepId, WizardData } from './flow.ts';
-import { MasterRampTracker, parseWizardPrefs, presetsWithCalibration, serializeWizardPrefs, WIZARD_PREFS_KEY } from './logic.ts';
+import { parseWizardPrefs, presetsWithCalibration, serializeWizardPrefs, WIZARD_PREFS_KEY } from './logic.ts';
 import { createAlignStep } from './step-align.ts';
 import { createAmpStep } from './step-amp.ts';
 import { createCheckStep } from './step-check.ts';
@@ -83,8 +83,6 @@ const INTRO: Record<StepId, string> = {
  */
 const STOP_EVENTS = new Set(['panic', 'howl', 'fault', 'disarmed', 'lifecycle']);
 
-const nowMs = (): number => (typeof performance !== 'undefined' ? performance.now() : Date.now());
-
 function safeLocalStorage(): Storage | null {
   try {
     return (globalThis as { localStorage?: Storage }).localStorage ?? null;
@@ -116,8 +114,6 @@ export function createWizard(container: HTMLElement, controller: AppController, 
   let analyzer: WorkerAnalyzer | null = null;
   let raf = 0;
   let destroyed = false;
-  const masterRamp = new MasterRampTracker();
-  masterRamp.observe(controller.state.params.masterDb, controller.state.armed, nowMs());
 
   // ------------------------------------------------------------------ open shell
 
@@ -199,7 +195,6 @@ export function createWizard(container: HTMLElement, controller: AppController, 
     get busy(): string | null {
       return op?.label ?? null;
     },
-    masterReadyInMs: () => masterRamp.readyInMs(nowMs()),
     refresh: () => schedule(),
     savePrefs() {
       if (!data) return;
@@ -407,10 +402,7 @@ export function createWizard(container: HTMLElement, controller: AppController, 
 
   const unsub = controller.subscribe((s, change: ControllerChange) => {
     if (change === 'spectrum') return;
-    if (change === 'state') {
-      masterRamp.observe(s.params.masterDb, s.armed, nowMs());
-      guardCompleted(s);
-    }
+    if (change === 'state') guardCompleted(s);
     if (!isOpen && change !== 'state') return;
     schedule();
   });

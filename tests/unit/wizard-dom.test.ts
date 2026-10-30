@@ -1,7 +1,7 @@
 /**
  * The guided setup mounted on the fake DOM with a real AppController and a fake audio engine:
- * the amplifier-level noise only starts once the engine's rate-limited master has reached 0 dB
- * (safety-1), closing the wizard keeps the keyboard focus (ui-13), and reusing a saved calibration
+ * the amplifier-level noise only starts once the engine's meters report its rate-limited master at
+ * 0 dB, and says so when they never do (safety-1), closing the wizard keeps the keyboard focus (ui-13), and reusing a saved calibration
  * gives the saved master back and re-checks the paths, correcting gain and delay (ui-2, calib-9).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -11,13 +11,14 @@ import { createCalibration, defaultSweepBand, measurePath } from '../../src/audi
 import type { MeasureFn, PathData } from '../../src/audio/calibration.ts';
 import { deviceKey } from '../../src/audio/devices.ts';
 import type { DeviceOption } from '../../src/audio/devices.ts';
-import type { WorkletInMsg } from '../../src/audio/protocol.ts';
+import type { MeterSnapshot, WorkletInMsg } from '../../src/audio/protocol.ts';
 import { AppController } from '../../src/app/controller.ts';
 import type { DeviceProvider, EngineLike } from '../../src/app/controller.ts';
 import { PRESETS_STORAGE_KEY } from '../../src/app/presets.ts';
-import { clampParams, DEFAULT_PARAMS, dbToLin } from '../../src/dsp/params.ts';
+import { GainRamp } from '../../src/dsp/gain-ramp.ts';
+import { clampParams, DEFAULT_PARAMS, dbToLin, MASTER_MIN_DB } from '../../src/dsp/params.ts';
 import { mulberry32 } from '../../src/dsp/sweep.ts';
-import { masterSettleMs, toPathData } from '../../src/ui/wizard/logic.ts';
+import { masterSettleMs, masterWaitTimeoutMs, toPathData } from '../../src/ui/wizard/logic.ts';
 import type { StepEnv } from '../../src/ui/wizard/env.ts';
 import { createWizardData } from '../../src/ui/wizard/flow.ts';
 import { createMeasureStep } from '../../src/ui/wizard/step-measure.ts';
@@ -39,7 +40,38 @@ const STATS: AudioStats = {
   sinkId: '',
 };
 
+const ENGINE_FS = 48000;
+/** Meter period of the fake engine (the real one posts at ~30 Hz). */
+const METER_MS = 33;
+
+/** Meters of a running engine whose master GainRamp is at `masterDb`. */
+const metersOf = (masterDb: number): AudioEngineEvent & MeterSnapshot => ({
+  type: 'meters',
+  ref: { rmsDb: -30, peakDb: -20 },
+  err: null,
+  outL: { rmsDb: -120, peakDb: -120 },
+  outR: { rmsDb: -120, peakDb: -120 },
+  limiterGrDb: [0, 0],
+  armed: true,
+  muted: true,
+  bypass: false,
+  softStart: 0,
+  delaySamples: [1, 1],
+  delayClamped: [false, false],
+  blockSize: 128,
+  ch2: 'pending',
+  measuring: false,
+  masterDb: Math.max(MASTER_MIN_DB, masterDb),
+});
+
 class FakeEngine implements EngineLike {
+  /** The engine's master GainRamp (6 dB/s rises while armed), reported as meters.masterDb every METER_MS. */
+  readonly master = new GainRamp(ENGINE_FS, DEFAULT_PARAMS.masterDb);
+  /** false: no more meters (an engine that never confirms its master). */
+  metersOn = true;
+  private armed = false;
+  private masterTarget = DEFAULT_PARAMS.masterDb;
+  private meterTimer: ReturnType<typeof setInterval> | null = null;
   sent: WorkletInMsg[] = [];
   measureAt: number[] = [];
   state: 'idle' | 'mic' | 'error' = 'idle';
@@ -48,6 +80,10 @@ class FakeEngine implements EngineLike {
   trackInfo: TrackInfo | null = null;
   sinkSupported = true;
   async openMic(): Promise<void> {
+    this.meterTimer ??= setInterval(() => {
+      for (let n = 0; n < (ENGINE_FS * METER_MS) / 1000; n++) this.master.next();
+      if (this.metersOn) this.emit(metersOf(this.master.currentDb));
+    }, METER_MS);
     this.state = 'mic';
     this.stats = { ...STATS };
     this.trackInfo = { deviceId: 'usb-in', groupId: 'g-usb', label: INPUT.label, settings: STATS.trackSettings!, channelCount: 2 };
@@ -70,6 +106,15 @@ class FakeEngine implements EngineLike {
   async resume(): Promise<void> {}
   send(msg: WorkletInMsg): void {
     this.sent.push(msg);
+    // Disarmed, parameters apply at once; arming starts from them.
+    if (msg.type === 'params') {
+      this.masterTarget = msg.params.masterDb;
+      if (this.armed) this.master.setTargetDb(this.masterTarget);
+      else this.master.jumpTo(this.masterTarget);
+    } else if (msg.type === 'arm') {
+      this.armed = msg.armed;
+      this.master.jumpTo(this.masterTarget);
+    }
   }
   private listeners = new Set<(e: AudioEngineEvent) => void>();
   on(cb: (e: AudioEngineEvent) => void): () => void {
@@ -122,7 +167,6 @@ describe('step 5: the loopback texts name the input the cable borrows (calib-ui-
       startOp: () => ({ signal: new AbortController().signal, end() {} }),
       abortOp() {},
       busy: null,
-      masterReadyInMs: () => 0,
       refresh() {},
       savePrefs() {},
       goTo() {},
@@ -143,54 +187,87 @@ describe('step 5: the loopback texts name the input the cable borrows (calib-ui-
   });
 });
 
-describe('step 2: the level noise waits for the master ramp (safety-1)', () => {
-  it('raises the master to 0 dB on entering and posts the first noise chunk only once it has settled', async () => {
-    const { c, e, host } = await setup();
-    expect(c.state.params.masterDb).toBe(-30);
-    button(host, 'Avanti').click();
-    expect(host.textContent).toMatch(/Passo 2 di 7/);
-    // Entering the step starts the 6 dB/s ramp, silently (anti-noise muted, nothing playing).
-    expect(c.state.params.masterDb).toBe(0);
+describe('step 2: the level noise waits for the live master (safety-1)', () => {
+  const tick = (host: FakeElement): void => {
     for (const cb of host.all((x) => x.tagName === 'INPUT' && x.type === 'checkbox').slice(0, 3)) {
       cb.checked = true;
       cb.dispatchEvent(new FakeEvent('change'));
     }
-    await vi.advanceTimersByTimeAsync(50);
+  };
+
+  it('raises the master to 0 dB on entering and posts the first noise chunk as soon as the meters report it there', async () => {
+    const { c, e, host } = await setup();
+    expect(c.state.params.masterDb).toBe(-30);
+    button(host, 'Avanti').click();
+    const entered = performance.now();
+    expect(host.textContent).toMatch(/Passo 2 di 7/);
+    // Entering the step starts the 6 dB/s ramp, silently (anti-noise muted, nothing playing).
+    expect(c.state.params.masterDb).toBe(0);
+    tick(host);
+    await vi.advanceTimersByTimeAsync(100);
     const play = button(host, 'Fai suonare il rumore di prova');
-    expect(play.disabled).toBe(true);
     expect(host.textContent).toMatch(/Il volume master sta salendo a 0 dB/);
-    await vi.advanceTimersByTimeAsync(3000);
-    expect(play.disabled).toBe(true);
-    play.click();
-    expect(e.measureAt).toHaveLength(0);
-    await vi.advanceTimersByTimeAsync(masterSettleMs(-30, 0));
+    // Pressing play while it rises waits for the master instead of playing quieter.
     expect(play.disabled).toBe(false);
-    const t0 = performance.now();
     play.click();
-    await vi.advanceTimersByTimeAsync(10);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(host.textContent).toMatch(/parte appena il motore audio conferma che è arrivato/);
+    let arrived = -1;
+    for (let i = 0; i < 400 && e.measureAt.length === 0; i++) {
+      await vi.advanceTimersByTimeAsync(10);
+      if (arrived < 0 && (c.state.meters?.masterDb ?? -120) >= -0.1) arrived = performance.now();
+    }
     expect(e.measureAt).toHaveLength(1);
-    expect(e.measureAt[0]).toBeGreaterThanOrEqual(t0);
+    // Within 0.1 dB of 0 dB per the meters, not before, and with no time model on top.
+    expect(arrived).toBeGreaterThan(0);
+    expect(e.measureAt[0]).toBeGreaterThanOrEqual(arrived - 10);
+    expect(e.measureAt[0]).toBeLessThanOrEqual(arrived + 10);
+    expect(e.master.currentDb).toBeGreaterThan(-0.1 - 0.05);
+    // ≈ 4 s at 6 dB/s, earlier than the old conservative model (empty rise budget assumed).
+    expect(e.measureAt[0]! - entered).toBeGreaterThan(3900);
+    expect(e.measureAt[0]! - entered).toBeLessThan(masterSettleMs(-30, 0) - 500);
   });
 
   it('a master changed meanwhile delays the noise again', async () => {
     const { c, e, host } = await setup();
     button(host, 'Avanti').click();
-    for (const cb of host.all((x) => x.tagName === 'INPUT' && x.type === 'checkbox').slice(0, 3)) {
-      cb.checked = true;
-      cb.dispatchEvent(new FakeEvent('change'));
-    }
+    tick(host);
     await vi.advanceTimersByTimeAsync(masterSettleMs(-30, 0) + 100);
+    expect(c.state.meters?.masterDb).toBeCloseTo(0, 1);
     // The user turns the master down from the top bar and presses play right away.
     c.setMaster(-20);
     await vi.advanceTimersByTimeAsync(20);
     expect(c.state.params.masterDb).toBe(0);
     const play = button(host, 'Fai suonare il rumore di prova');
-    expect(play.disabled).toBe(true);
-    await vi.advanceTimersByTimeAsync(masterSettleMs(0, -20) + masterSettleMs(-20, 0) + 100);
-    expect(play.disabled).toBe(false);
     play.click();
-    await vi.advanceTimersByTimeAsync(10);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(e.measureAt).toHaveLength(0);
+    for (let i = 0; i < 300 && e.measureAt.length === 0; i++) await vi.advanceTimersByTimeAsync(10);
     expect(e.measureAt).toHaveLength(1);
+    expect(e.master.currentDb).toBeGreaterThan(-0.15);
+  });
+
+  it('without the meters confirming the master, the noise never starts and the step says why', async () => {
+    const { c, e, host } = await setup();
+    await vi.advanceTimersByTimeAsync(100);
+    // An engine whose meters stop: the last report (−30 dB) stays.
+    e.metersOn = false;
+    button(host, 'Avanti').click();
+    tick(host);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(c.state.meters?.masterDb).toBe(-30);
+    button(host, 'Fai suonare il rumore di prova').click();
+    const timeout = masterWaitTimeoutMs(-30, 0);
+    expect(timeout).toBe(10_000);
+    await vi.advanceTimersByTimeAsync(timeout - 100);
+    expect(e.measureAt).toHaveLength(0);
+    expect(host.textContent).not.toMatch(/non è arrivato/);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(e.measureAt).toHaveLength(0);
+    expect(host.textContent).toMatch(/Il volume master non è arrivato a 0 dB entro 10 s: il rumore di prova non è partito/);
+    // The operation ended: the user can try again.
+    expect(button(host, 'Fai suonare il rumore di prova').disabled).toBe(false);
+    expect(host.all((x) => x.classList.contains('wz-busy'))[0]!.textContent).toBe('');
   });
 });
 

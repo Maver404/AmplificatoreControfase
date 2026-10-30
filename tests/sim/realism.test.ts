@@ -18,7 +18,7 @@ import {
 } from '../../src/audio/calibration.ts';
 import type { CalibrationData, MeasurePathOptions, SolveOutcome } from '../../src/audio/calibration.ts';
 import type { SpeakerConfig } from '../../src/dsp/alignment.ts';
-import { clampParams } from '../../src/dsp/params.ts';
+import { clampParams, withoutTrims } from '../../src/dsp/params.ts';
 import type { EngineParams } from '../../src/dsp/params.ts';
 import { headStartSeconds, speedOfSound } from '../../src/dsp/physics.ts';
 import { SimRig, bandLevelDb, toneLevelDb } from './harness.ts';
@@ -134,7 +134,7 @@ describe('closed loop, realistic rooms', () => {
     expect(Math.abs(out.result.predictedAttenuationDb - measured)).toBeLessThan(2);
   }, 60000);
 
-  it('11. a tonal source 0.2 s upstream: the tonal solution cancels the harmonics ≥ 15 dB', async () => {
+  it('11. a tonal source 0.2 s upstream: the tonal solution cancels each harmonic ≥ 15 dB', async () => {
     const cfg = causalBroadband({
       noise: { tone: { f0: 100, amplitudes: [0.04, 0.025, 0.015, 0.01] }, broadband: { rms: 0.002 } },
       primary: { delayS: 0.2, gain: 0.7 },
@@ -153,9 +153,53 @@ describe('closed loop, realistic rooms', () => {
     rig.run(1);
     const on = rig.run(2, ['err']).err!;
     const off = rig.bypassed(() => rig.run(2, ['err']).err!);
+    // Per harmonic: 16.4 / 19.9 / 17.2 / 10.4 dB with the delay alone, ≥ 40 dB with the harmonic trims.
+    for (const h of [1, 2, 3, 4]) expect(toneLevelDb(off, fs, 100 * h) - toneLevelDb(on, fs, 100 * h)).toBeGreaterThanOrEqual(15);
     const tonalPower = (x: Float32Array): number =>
       [100, 200, 300, 400].reduce((s, f) => s + Math.pow(10, toneLevelDb(x, fs, f) / 10), 0);
     expect(10 * Math.log10(tonalPower(off) / tonalPower(on))).toBeGreaterThanOrEqual(15);
+  }, 60000);
+
+  it('14. tonal stress: HP 40 Hz, barrier on, a wall-like primary and a room-like speaker path: each harmonic ≥ 12 dB', async () => {
+    const cfg = causalBroadband({
+      noise: { tone: { f0: 100, amplitudes: [0.04, 0.025, 0.015, 0.01] }, broadband: { rms: 0.002 } },
+      // Through a wall (1st-order low-pass) with two reflections, 0.2 s upstream.
+      primary: { delayS: 0.2, gain: 0.7, lowpassHz: 150, reflections: [{ delayS: 0.0037, gain: 0.3 }, { delayS: 0.0091, gain: -0.2 }] },
+      // A small speaker (roll-off below 90 Hz) in a room: strong early reflections and a diffuse tail.
+      secondary: [
+        {
+          delayS: 0.003,
+          gain: 2,
+          highpassHz: 90,
+          reflections: [{ delayS: 0.0025, gain: 0.5 }, { delayS: 0.0061, gain: -0.4 }],
+          tail: { rt60S: 0.08, gain: 0.08, seed: 5 },
+        },
+        null,
+      ],
+      feedback: [{ delayS: 0.004, gain: 0.3, tail: { rt60S: 0.08, gain: 0.02, seed: 6 } }, null],
+      seed: 17,
+    });
+    const rig = new SimRig(cfg, RIG);
+    const p = calibrationParams('single');
+    p.filters = { ...p.filters, hpFreq: 40, hpOrder: 2, barrierEnabled: true };
+    const cal = await calibrate(rig, p, 3);
+    p.phaseMode = 'tonal';
+    p.tonal.f0 = cal.primary!.tonalF0!;
+    expect(Math.abs(p.tonal.f0 - 100)).toBeLessThan(0.01);
+    const out = solveFromCalibration(cal, p, fs);
+    expect(out.params.channels[0].enabled).toBe(true);
+    const drops = (params: EngineParams): number[] => {
+      apply(rig, { ...out, params }, cal);
+      rig.run(1);
+      const on = rig.run(2, ['err']).err!;
+      const off = rig.bypassed(() => rig.run(2, ['err']).err!);
+      return [1, 2, 3, 4].map((h) => toneLevelDb(off, fs, 100 * h) - toneLevelDb(on, fs, 100 * h));
+    };
+    // Measured: the delay alone 9.0 / 13.5 / 0.7 / −6.0 dB (the 4th harmonic louder than without anti-noise),
+    // with the harmonic trims 36 / 48 / 42 / 68 dB.
+    expect(Math.min(...drops(withoutTrims(out.params)))).toBeLessThan(6);
+    for (const d of drops(out.params)) expect(d).toBeGreaterThanOrEqual(12);
+    expect(rig.autoMuted).toBe(false);
   }, 60000);
 
   it('12. geometry only with an inverting amplifier: the polarity measured on F keeps the cancellation', async () => {

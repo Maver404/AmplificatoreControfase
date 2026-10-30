@@ -17,6 +17,7 @@ import { besselLowpassSections } from './dsp/bessel-lp.ts';
 import { biquadResponse } from './dsp/biquad.ts';
 import { cMul } from './dsp/complex.ts';
 import type { Complex } from './dsp/complex.ts';
+import { anyTrim } from './dsp/harmonic-trims.ts';
 import { hilbertResponse } from './dsp/hilbert-pair.ts';
 import { DEFAULT_PARAMS, RANGES, computeChannelDelay, dbToLin, phaseReferenceHz } from './dsp/params.ts';
 import { headStartSeconds, speedOfSound } from './dsp/physics.ts';
@@ -31,7 +32,7 @@ import { createMetersView } from './ui/meters-view.ts';
 import { createPrecisionControl } from './ui/precision-control.ts';
 import { createPresetsPanel } from './ui/presets-panel.ts';
 import type { PresetSummary } from './ui/presets-panel.ts';
-import { createScopeView } from './ui/scope-view.ts';
+import { createScopeView, trimmedChannels } from './ui/scope-view.ts';
 import { createSpectrumView } from './ui/spectrum-view.ts';
 import { createStatusBar, startControl, statusOverride } from './ui/status-bar.ts';
 import { formatHz, formatNumber } from './ui/units.ts';
@@ -248,17 +249,20 @@ const devicePanel = createDevicePanel(byId('devices'), {
   onLatencyModeChange: (mode) => void controller.setLatencyMode(mode),
 });
 
+// Every strip edit, the harmonic trims included, goes through setChannel, which applies the L/R link.
 const strips: [ChannelStrip, ChannelStrip] = [
   createChannelStrip(byId('strip-l'), {
     channel: 'L',
     initial: controller.state.params.channels[0],
     onChange: (next, changed) => controller.setChannel(0, next, changed),
+    onClearTrims: () => controller.clearHarmonicTrims(0),
     onLinkChange: (v) => controller.setLinked(v),
   }),
   createChannelStrip(byId('strip-r'), {
     channel: 'R',
     initial: controller.state.params.channels[1],
     onChange: (next, changed) => controller.setChannel(1, next, changed),
+    onClearTrims: () => controller.clearHarmonicTrims(1),
     onLinkChange: (v) => controller.setLinked(v),
   }),
 ];
@@ -507,6 +511,8 @@ function renderStrips(s: ControllerState): void {
       phaseMode: s.params.phaseMode,
       gainUnlocked: s.params.gainUnlocked,
       linked: s.linked,
+      harmonics: s.params.tonal.harmonics,
+      otherTrimmed: anyTrim(s.params.channels[i === 0 ? 1 : 0].harmonicTrims),
     }),
   );
 }
@@ -581,6 +587,7 @@ function renderState(s: ControllerState): void {
       s.params.phaseMode === 'hilbert'
         ? 'In modalità Hilbert la traccia attesa non include la rotazione di fase: le due tracce non coincidono.'
         : '',
+    trimmed: trimmedChannels(s.params),
   });
   pushAlignment();
   presetsPanel.update({

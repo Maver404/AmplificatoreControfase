@@ -41,6 +41,12 @@ export interface MeterSnapshot {
   blockSize: number;
   ch2: Ch2Status;
   measuring: boolean;
+  /**
+   * Master gain applied right now, dB: the engine's master ramp after smoothing, rise limiting and the
+   * stimulus override (it jumps to the target when a calibration stimulus starts), i.e. what a stimulus sample
+   * is multiplied by now; MASTER_MIN_DB (−120) when the master is silent.
+   */
+  masterDb: number;
 }
 
 export type WorkletInMsg =

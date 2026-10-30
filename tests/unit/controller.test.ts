@@ -5,15 +5,18 @@ import { TAP_BLOCK_FRAMES, TAP_CHANNELS } from '../../src/audio/protocol.ts';
 import type { MeterSnapshot, WorkletInMsg } from '../../src/audio/protocol.ts';
 import {
   AppController,
+  LEGACY_FEEDBACK_TAPS_KEY,
   PHASE_SETTLE_MS,
   describeDevice,
   firstProblem,
   safeApplySequence,
 } from '../../src/app/controller.ts';
 import type { DeviceProvider, EngineLike, MicPermission } from '../../src/app/controller.ts';
+import type { F0Analyzer } from '../../src/audio/analysis-client.ts';
 import { ISSUE } from '../../src/app/validation.ts';
-import { DEFAULT_PARAMS, HEADPHONES_CEILING_DB, clampParams } from '../../src/dsp/params.ts';
+import { DEFAULT_PARAMS, HEADPHONES_CEILING_DB, clampParams, neutralTrims } from '../../src/dsp/params.ts';
 import type { EngineParams } from '../../src/dsp/params.ts';
+import { autotuneDriver } from '../../src/ui/wizard/ops.ts';
 
 // ------------------------------------------------------------------------------- fakes
 
@@ -190,6 +193,7 @@ const meters = (over: Partial<MeterSnapshot> = {}): AudioEngineEvent => ({
   blockSize: 128,
   ch2: 'ok',
   measuring: false,
+  masterDb: -30,
   ...over,
 });
 
@@ -612,6 +616,94 @@ describe('AppController: parameters and presets', () => {
     expect(e.types()).toEqual(['params']);
   });
 
+  it('harmonic trims flow through setChannel / setHarmonicTrim (linked: offsets kept) and applyParams', () => {
+    const { c, e } = setup();
+    c.setHarmonicTrim(0, 3, { gainDb: 2.5, phaseDeg: -20 });
+    expect(c.state.params.channels[0].harmonicTrims[2]).toEqual({ gainDb: 2.5, phaseDeg: -20 });
+    expect(e.lastParams().channels[0].harmonicTrims[2]).toEqual({ gainDb: 2.5, phaseDeg: -20 });
+    expect(c.state.params.channels[1].harmonicTrims[2]).toEqual({ gainDb: 0, phaseDeg: 0 });
+    // Out of range values are clamped; h outside 1…8 is ignored.
+    c.setHarmonicTrim(1, 1, { gainDb: 40, phaseDeg: 500 });
+    expect(c.state.params.channels[1].harmonicTrims[0]).toEqual({ gainDb: 6, phaseDeg: 180 });
+    const before = JSON.stringify(c.state.params);
+    c.setHarmonicTrim(0, 9, { gainDb: 1, phaseDeg: 1 });
+    c.setHarmonicTrim(0, 0, { gainDb: 1, phaseDeg: 1 });
+    expect(JSON.stringify(c.state.params)).toBe(before);
+    // Linked: the same change on both channels, each keeping its own trim.
+    c.setLinked(true);
+    c.setHarmonicTrim(0, 3, { gainDb: 1.5, phaseDeg: -10 });
+    expect(c.state.params.channels[0].harmonicTrims[2]).toEqual({ gainDb: 1.5, phaseDeg: -10 });
+    expect(c.state.params.channels[1].harmonicTrims[2].gainDb).toBeCloseTo(-1, 12);
+    expect(c.state.params.channels[1].harmonicTrims[2].phaseDeg).toBeCloseTo(10, 12);
+    // The whole set through setChannel.
+    const all = c.state.params.channels[0].harmonicTrims.map((t) => ({ ...t, gainDb: t.gainDb - 1 }));
+    c.setChannel(0, { ...c.state.params.channels[0], harmonicTrims: all }, 'harmonicTrims');
+    expect(c.state.params.channels[0].harmonicTrims[2].gainDb).toBeCloseTo(0.5, 12);
+    expect(c.state.params.channels[1].harmonicTrims[2].gainDb).toBeCloseTo(-2, 12);
+    expect(c.state.params.channels[1].harmonicTrims[7].gainDb).toBeCloseTo(-1, 12);
+    // applyParams carries them to the engine.
+    const p = clampParams(c.state.params);
+    p.channels[1].harmonicTrims[5] = { gainDb: -4, phaseDeg: 33 };
+    c.applyParams(p);
+    expect(e.lastParams().channels[1].harmonicTrims[5]).toEqual({ gainDb: -4, phaseDeg: 33 });
+  });
+
+  it('clearHarmonicTrims («Azzera armoniche»): an absolute reset of the channel, of both while linked, sent to the engine', () => {
+    const { c, e } = setup();
+    const p = clampParams(c.state.params);
+    p.channels[0].harmonicTrims[0] = { gainDb: 0, phaseDeg: -170 };
+    p.channels[0].harmonicTrims[1] = { gainDb: -28, phaseDeg: 0 };
+    p.channels[1].harmonicTrims[0] = { gainDb: 0, phaseDeg: 170 };
+    p.channels[1].harmonicTrims[1] = { gainDb: 4, phaseDeg: 0 };
+    c.applyParams(p);
+    c.clearHarmonicTrims(0);
+    expect(c.state.params.channels[0].harmonicTrims).toEqual(neutralTrims());
+    expect(c.state.params.channels[1].harmonicTrims).toEqual(p.channels[1].harmonicTrims);
+    expect(e.lastParams().channels[0].harmonicTrims).toEqual(neutralTrims());
+    // linked: both (a delta would have left L at −160° / −26 dB and raised R to +6 dB)
+    c.applyParams(p);
+    c.setLinked(true);
+    c.clearHarmonicTrims(1);
+    expect(c.state.params.channels[0].harmonicTrims).toEqual(neutralTrims());
+    expect(c.state.params.channels[1].harmonicTrims).toEqual(neutralTrims());
+  });
+
+  it('the calibrated (double-click) values include the trims, as copies, with their per-harmonic attenuation', async () => {
+    const { c } = setup();
+    const p = clampParams(c.state.params);
+    p.channels[0].harmonicTrims[1] = { gainDb: -3, phaseDeg: 12 };
+    const harmonics = [
+      { h: 1, freqHz: 100, attenuationDb: 32, source: 'predicted' as const },
+      { h: 2, freqHz: 200, attenuationDb: 8, source: 'predicted' as const, capped: true },
+      { h: 12, freqHz: 1200, attenuationDb: 1, source: 'predicted' as const },
+    ];
+    c.applyParams(p, { calibrated: true, harmonics });
+    const cal = c.state.calibratedChannels!;
+    expect(cal[0].harmonicTrims[1]).toEqual({ gainDb: -3, phaseDeg: 12 });
+    expect(cal[0].harmonicTrims).not.toBe(c.state.params.channels[0].harmonicTrims);
+    expect(cal[0].harmonicTrims[1]).not.toBe(c.state.params.channels[0].harmonicTrims[1]);
+    // Entries outside 1…8 are dropped.
+    expect(c.state.calibratedHarmonics).toEqual(harmonics.slice(0, 2));
+    // Editing a trim leaves the calibrated value alone; the double-click restores it.
+    c.setHarmonicTrim(0, 2, { gainDb: 4, phaseDeg: -50 });
+    expect(c.state.calibratedChannels![0].harmonicTrims[1]).toEqual({ gainDb: -3, phaseDeg: 12 });
+    c.setHarmonicTrim(0, 2, c.state.calibratedChannels![0].harmonicTrims[1]);
+    expect(c.state.params.channels[0].harmonicTrims[1]).toEqual({ gainDb: -3, phaseDeg: 12 });
+    // An autotune result replaces them ('measured'); calibrated values without harmonics clear them.
+    c.applyParams(p, { calibrated: true, harmonics: [{ h: 3, freqHz: 300, attenuationDb: 25, source: 'measured' }] });
+    expect(c.state.calibratedHarmonics).toEqual([{ h: 3, freqHz: 300, attenuationDb: 25, source: 'measured' }]);
+    c.applyParams(p, { calibrated: true });
+    expect(c.state.calibratedHarmonics).toBeNull();
+    // A preset's values (trims included) become the calibrated ones.
+    c.applyParams(p, { calibrated: true, harmonics });
+    c.savePreset('Tonale');
+    c.applyParams(clampParams(undefined));
+    c.loadPreset(c.state.presets.list[0]!.id);
+    expect(c.state.params.channels[0].harmonicTrims[1]).toEqual({ gainDb: -3, phaseDeg: 12 });
+    expect(c.state.calibratedChannels![0].harmonicTrims[1]).toEqual({ gainDb: -3, phaseDeg: 12 });
+    expect(c.state.calibratedHarmonics).toBeNull();
+  });
+
   it('single-speaker configuration turns the R output off', () => {
     const { c } = setup();
     c.setSpeakers('single');
@@ -983,6 +1075,50 @@ describe('AppController: review fixes', () => {
     expect(again.state.feedbackTaps).toBe(128);
   });
 
+  it('feedback taps: the old UI key is read once into the prefs, clamped, and removed', () => {
+    const make = (prefs: MemoryStorage): AppController => {
+      const c = new AppController({ engine: new FakeEngine(), devices, presetStorage: null, prefsStorage: prefs });
+      controllers.push(c);
+      return c;
+    };
+    const prefs = new MemoryStorage();
+    prefs.setItem(LEGACY_FEEDBACK_TAPS_KEY, '512');
+    expect(make(prefs).state.feedbackTaps).toBe(512);
+    expect(prefs.getItem(LEGACY_FEEDBACK_TAPS_KEY)).toBeNull();
+    expect(JSON.parse(prefs.getItem('controfase.devices.v1')!).feedbackTaps).toBe(512);
+    // Next start: from the prefs.
+    expect(make(prefs).state.feedbackTaps).toBe(512);
+    // Out of range: clamped; device prefs already saved are kept.
+    const old = new MemoryStorage();
+    old.setItem('controfase.devices.v1', JSON.stringify({ inputId: 'usb-in', outputId: 'usb-out', latencyMode: 'ultra' }));
+    old.setItem(LEGACY_FEEDBACK_TAPS_KEY, '4096');
+    expect(make(old).state.feedbackTaps).toBe(1024);
+    expect(JSON.parse(old.getItem('controfase.devices.v1')!)).toEqual({ inputId: 'usb-in', outputId: 'usb-out', latencyMode: 'ultra', feedbackTaps: 1024 });
+    // The prefs already have a value: the old key is ignored (and removed).
+    const both = new MemoryStorage();
+    both.setItem('controfase.devices.v1', JSON.stringify({ feedbackTaps: 128 }));
+    both.setItem(LEGACY_FEEDBACK_TAPS_KEY, '512');
+    expect(make(both).state.feedbackTaps).toBe(128);
+    expect(both.getItem(LEGACY_FEEDBACK_TAPS_KEY)).toBeNull();
+    // Garbage: the default, and the key goes.
+    const bad = new MemoryStorage();
+    bad.setItem(LEGACY_FEEDBACK_TAPS_KEY, 'molti');
+    expect(make(bad).state.feedbackTaps).toBe(256);
+    expect(bad.getItem(LEGACY_FEEDBACK_TAPS_KEY)).toBeNull();
+    // A JSON number written as a string reads the same; a blank one is no value (not 0 → 128).
+    const quoted = new MemoryStorage();
+    quoted.setItem(LEGACY_FEEDBACK_TAPS_KEY, '"1024"');
+    expect(make(quoted).state.feedbackTaps).toBe(1024);
+    const blank = new MemoryStorage();
+    blank.setItem(LEGACY_FEEDBACK_TAPS_KEY, ' ');
+    expect(make(blank).state.feedbackTaps).toBe(256);
+    expect(blank.getItem(LEGACY_FEEDBACK_TAPS_KEY)).toBeNull();
+    // Without storage nothing happens.
+    const none = new AppController({ engine: new FakeEngine(), devices, presetStorage: null, prefsStorage: null });
+    controllers.push(none);
+    expect(none.state.feedbackTaps).toBe(256);
+  });
+
   it('a failed output switch keeps the output actually in use (shown, validated, remembered)', async () => {
     const e = new FakeEngine();
     const prefs = new MemoryStorage();
@@ -1106,5 +1242,50 @@ describe('AppController: review fixes', () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(c.state.permission).toBe('denied');
+  });
+});
+
+// ------------------------------------------------------------------------------- f0 follower vs autotune
+
+describe('AppController: the live f0 follower during a wizard autotune (ops.ts driver)', () => {
+  it('probes and the restore apply only their channels: f0 stays where the follower put it', async () => {
+    vi.useFakeTimers();
+    let sourceF0 = 100.2;
+    const f0Analyzer: F0Analyzer = { estimateF0: async () => ({ f0: sourceF0, confidence: 0.9, dominanceDb: 30 }) };
+    const e = new FakeEngine();
+    const c = new AppController({ engine: e, devices, presetStorage: null, prefsStorage: null, now: () => clockMs, f0Analyzer });
+    controllers.push(c);
+    await openUsb(c, e);
+    c.applyParams({ ...c.currentParams, phaseMode: 'tonal', tonal: { f0: 100, harmonics: 4, q: 30 } });
+    // What a run copies at its start (step-align: controller.currentParams), before the source drifts.
+    const start = c.currentParams;
+    const tick = async (): Promise<void> => {
+      feedTaps(e, 2.1, -30, -40);
+      await vi.advanceTimersByTimeAsync(2000);
+    };
+    await tick();
+    expect(c.state.params.tonal.f0).toBe(100.2);
+    const drv = autotuneDriver(c, { fs: 48000, band: [20, 1000], signal: new AbortController().signal, onMeasure: () => {} });
+    e.sent = [];
+    // A probe: the start with one trim and the gain changed (f0 still the start's 100 Hz).
+    const probe = structuredClone(start);
+    probe.channels[0].harmonicTrims[1] = { gainDb: 1.5, phaseDeg: -10 };
+    probe.channels[0].gainDb = -12;
+    drv.apply(probe, false);
+    expect(e.lastParams().tonal.f0).toBe(100.2);
+    expect(e.lastParams().channels[0].gainDb).toBe(-12);
+    expect(e.lastParams().channels[0].harmonicTrims[1]).toEqual({ gainDb: 1.5, phaseDeg: -10 });
+    // The follower moves on with the probe's channels.
+    sourceF0 = 100.4;
+    await tick();
+    expect(e.lastParams().tonal.f0).toBe(100.4);
+    expect(e.lastParams().channels[0].harmonicTrims[1]).toEqual({ gainDb: 1.5, phaseDeg: -10 });
+    // The restore (aborted run) puts the start's channels back, not its f0.
+    drv.apply(start, true);
+    expect(e.lastParams().tonal.f0).toBe(100.4);
+    expect(e.lastParams().channels).toEqual(start.channels);
+    // Every f0 the engine got since the probes began: never back to the stale 100 Hz.
+    const f0s = e.sent.flatMap((m) => (m.type === 'params' ? [m.params.tonal.f0] : []));
+    expect(f0s).toEqual([100.2, 100.4, 100.4]);
   });
 });

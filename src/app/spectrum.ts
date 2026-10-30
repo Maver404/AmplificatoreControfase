@@ -130,3 +130,41 @@ export class SpectrumAccumulator {
     this.frames++;
   }
 }
+
+/** Spectrum levels in dB per bin (bin k = k·fs/fftSize), as SpectrumAccumulator.db. */
+type DbBins = ArrayLike<number>;
+
+/** Power sum (dB) of bins k − half … k + half; −Infinity when nothing is there. */
+function binsDb(db: DbBins, k: number, half: number): number {
+  let p = 0;
+  for (let i = Math.max(0, k - half); i <= Math.min(db.length - 1, k + half); i++) {
+    const v = db[i];
+    if (Number.isFinite(v)) p += Math.pow(10, v / 10);
+  }
+  return p > 0 ? 10 * Math.log10(p) : -Infinity;
+}
+
+/**
+ * Measured attenuation at each harmonic h·f0 (h = 1 … harmonics; index h − 1) from the controller's ANC on /
+ * off spectra (SpectraSnapshot): A_h = [L_err − L_rif]_off − [L_err − L_rif]_on, dB, positive = quieter with
+ * the anti-noise, each level the power of the Hann main lobe around the harmonic (± 2 bins, fewer when the
+ * harmonics are closer than that). null for a harmonic at or above 0.45·fs or when a spectrum is missing.
+ */
+export function harmonicAttenuationDb(
+  s: { fs: number; fftSize: number; err: DbBins | null; errBypass: DbBins | null; refOn: DbBins | null; refOff: DbBins | null },
+  f0: number,
+  harmonics: number,
+): (number | null)[] {
+  const n = Math.max(0, Math.min(64, Math.floor(Number.isFinite(harmonics) ? harmonics : 0)));
+  const ok = s.err !== null && s.errBypass !== null && s.refOn !== null && s.refOff !== null && s.fs > 0 && s.fftSize > 0 && f0 > 0;
+  const binHz = s.fs / s.fftSize;
+  const half = Math.max(0, Math.min(2, Math.floor((f0 / binHz - 1) / 2)));
+  return Array.from({ length: n }, (_, i) => {
+    const f = (i + 1) * f0;
+    if (!ok || f >= 0.45 * s.fs) return null;
+    const k = Math.round(f / binHz);
+    const v = [s.errBypass!, s.refOff!, s.err!, s.refOn!].map((a) => binsDb(a, k, half));
+    if (!v.every(Number.isFinite)) return null;
+    return v[0] - v[1] - (v[2] - v[3]);
+  });
+}

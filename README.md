@@ -39,7 +39,8 @@ Interfaccia in italiano; stack: Vite + TypeScript, test con Vitest e Playwright,
    di default, 10–200 Hz) → compensazione barriera opzionale (passa-basso del 1° ordine che imita una
    parete/finestra) → passa-basso Bessel (500 Hz di default, 100–4000 Hz).
 3. **Modalità tonale** (solo per rumori periodici): banco di risonatori sulle armoniche di f0, così si
-   riproduce solo il tono e non il rumore a banda larga.
+   riproduce solo il tono e non il rumore a banda larga; ogni uscita può correggere guadagno e fase di ciascuna
+   armonica (vedi sotto).
 4. **Per ogni uscita L/R**: ritardo frazionario (precisione sotto il campione) → polarità → guadagno → muto e
    avvio graduale → volume master → limitatore con tetto (ceiling) in dBFS, preceduto dal rilevatore di
    innesco.
@@ -50,13 +51,59 @@ e positivo = ritardo, riferita alla frequenza f_ref (a f0 in modalità tonale). 
 | Modalità | Quando | Come agisce Δ |
 |---|---|---|
 | **Ritardo** (default) | Qualunque rumore | Ritardo aggiuntivo Δ/(360°·f_ref), nessuna dispersione |
-| **Tonale** | Rumori periodici stabili (motori, compressori, trasformatori); suggerita quando l'app rileva un tono dominante | Ritardo avvolto su periodi interi 1/f0; f0 stimata con precisione sub-bin e inseguita |
+| **Tonale** | Rumori periodici stabili (motori, compressori, trasformatori); suggerita quando l'app rileva un tono dominante | Ritardo avvolto su periodi interi 1/f0; f0 stimata con precisione sub-bin e inseguita; all'armonica h vale h·Δ più la correzione di quell'armonica |
 | **Hilbert** (avanzata) | Ottimizzazione con mic d'errore e regolazione automatica | Rotazione di fase a larga banda; aggiunge ritardo di gruppo (≈ 2,6 ms a 100 Hz) |
+
+**Correzioni per armonica (solo modalità tonale).** Un unico ritardo sposta la fase di ogni armonica h di h·Δ:
+basterebbe solo se filtri, casse e stanza non aggiungessero altro, e di solito non è così (nel simulatore, con il
+solo ritardo, la fondamentale a 100 Hz scende di 17 dB e la 4ª armonica solo di circa 10). Per questo ogni uscita
+ha, per ogni armonica, una correzione di **guadagno** (−30…+6 dB) e di **fase** (−180…+180°, positivo = ritardo)
+che si aggiunge al ritardo:
+
+`fase totale all'armonica h = polarità + h·Δ + θ_h`
+
+- Le calcola il **passo 6** della configurazione guidata insieme a ritardo, guadagno e polarità, e vengono
+  applicate con la soluzione; il passo 6 mostra l'attenuazione prevista armonica per armonica, con e senza
+  correzioni, e il passo 7 quella misurata dal mic d'errore. Con il mic d'errore l'**autotune** del passo 6, in
+  modalità tonale, affina proprio queste correzioni misurando ogni armonica (sincrona a h·f0).
+- Il calcolo tiene conto della parte di anti-rumore che torna al microfono di riferimento anche dopo la
+  neutralizzazione del feedback. Se a un'armonica questo anello supera il margine di stabilità (−6 dB), viene
+  ridotta solo la correzione di quell'armonica (le altre restano), a meno che ridurre tutti i guadagni non dia di
+  più nel complesso; il passo 6 lo indica accanto all'armonica («correzione ridotta di X dB per la stabilità»).
+  Con due zone separate le previsioni di ogni zona tengono conto del feedback di entrambe le casse; se con entrambe
+  attive le correzioni per armonica di una zona attenuano meno del solo ritardo e guadagno, quella zona usa solo
+  ritardo e guadagno. Se con entrambe le casse attive una zona scende sotto 1 dB, una cassa resta spenta (quella della
+  zona che da sola attenua meno) e il passo 6 lo dice («Solo la zona R è attenuata…»); l’autotune regola allora solo
+  la zona dell’altra cassa, e riusando la calibrazione salvata la cassa spenta resta spenta.
+- Tra parentesi, per ogni armonica, il passo 6 mostra l’attenuazione con il solo ritardo e guadagno entro lo stesso
+  margine di stabilità: la soluzione con le correzioni per armonica non attenua mai meno di questa nel complesso.
+- Una previsione al limite del modello non viene mostrata come un numero preciso: «30 dB, limite di precisione
+  del modello senza mic d’errore» oppure «60 dB, limite di calcolo per un nullo esatto del modello misurato».
+- L'autotune confronta ogni misura con il livello in bypass dello stesso momento (il rumore ambiente può cambiare
+  di qualche dB durante la regolazione), applica i nuovi valori solo se l'ultima misura conferma il
+  miglioramento e si ferma, ripristinando i valori iniziali, se la fondamentale si sposta più di quanto le
+  correzioni tollerano (l'1 % con Q 30). Applica solo le correzioni dei canali: la f0 seguita nel frattempo e il
+  volume master restano quelli attuali.
+- Nella console sono nella sezione **«Armoniche»** di ogni canale (visibile solo in modalità tonale): frequenza
+  h·f0, guadagno, fase e fase totale di ogni armonica; doppio clic sul nome (o ↺) = valore calibrato,
+  **«Azzera armoniche»** = nessuna correzione (con «Collega L/R» attivo azzera entrambi i canali). Stessi tasti
+  degli altri controlli; con «Collega L/R» le fasi si spostano insieme anche oltre ±180° (è un angolo).
+- **Sicurezza**: come per i guadagni, un aumento di oltre 6 dB sale al massimo di **6 dB/s** (da −30 a +6 dB
+  servono 5–6 s); le diminuzioni, i cambi di fase e gli aumenti fino a 6 dB si applicano subito con una rampa di
+  20 ms. Il limite vale per il livello dell'armonica nel suo insieme: guadagno del canale, master e correzione
+  insieme non salgono più di 6 dB di colpo e poi di 6 dB/s. Con l'uscita in bypass o durante una misura gli
+  aumenti aspettano. Le correzioni non aprono il banco ai rumori sotto la fondamentale (vento, rombo): fuori dalle
+  armoniche il livello cambia al più di qualche dB oltre la correzione stessa.
+- Con tutte le correzioni a 0 l'uscita è identica, campione per campione, a quella senza correzioni. Le armoniche
+  oltre il numero impostato, o sopra il 45 % della frequenza di campionamento, non vengono generate e le loro
+  correzioni non hanno effetto. Nell'oscilloscopio la traccia attesa (−g·cond[n − D]) non le include: con
+  armoniche corrette atteso e uscita non coincidono del tutto.
 
 **Con il mic d'errore** l'app misura i percorsi acustici, calcola ritardo/guadagno/polarità ottimali, misura
 l'attenuazione reale (confronto A/B con il bypass) e regola automaticamente. **Senza mic d'errore** usa la
 geometria (distanze, angolo, temperatura) e una calibrazione a due posizioni con l'unico microfono, ma il
-risultato **non è misurabile**.
+risultato **non è misurabile** (l'attenuazione prevista in quel caso non supera circa 30 dB: il modello geometrico
+non è più preciso di così).
 
 **Cosa non fa**: non è un FxLMS adattivo completo; non usa ASIO su Windows; non funziona con Bluetooth o
 AirPlay; non crea una "bolla di silenzio" in tutta la stanza.
@@ -273,7 +320,9 @@ step: "Consenti microfono" (uscita a zero) → scelta dispositivi e validazione 
    guadagno) rimaste attive. Avviso con "continua comunque": latenza d'uscita > 40 ms, frequenze di
    campionamento diverse. Cuffie: tetto −24 dBFS e conferma.
 2. **Livello dell'amplificatore** — con l'ampli al minimo l'app emette rumore rosa in banda a −20 dBFS
-   attraverso il limitatore; alza l'ampli fino a circa il livello del rumore nella zona (≤ 85 dBA). Se in
+   attraverso il limitatore; alza l'ampli fino a circa il livello del rumore nella zona (≤ 85 dBA). Il volume
+   master dell'app sale a 0 dB (6 dB/s) e il rumore parte appena il motore audio conferma che è arrivato (se non
+   lo conferma entro 10–13 s il rumore non parte e l'app lo dice). Se in
    seguito la calibrazione chiede un guadagno sopra −6 dB, l'app ti dirà di alzare il guadagno d'ingresso
    (preamplificatore) del microfono di riferimento, non l'amplificatore; sotto −30 dB, di abbassare
    l'amplificatore.
@@ -286,8 +335,9 @@ step: "Consenti microfono" (uscita a zero) → scelta dispositivi e validazione 
    riferimento → errore dal rumore ambiente, loopback opzionale per la latenza elettrica.
 6. **Allineamento** — con il mic d'errore: risolutore su ritardo, guadagno, Δ e polarità con vincolo di
    stabilità dell'anello; senza: geometria + calibrazione a due posizioni (mic nella zona, poi di nuovo a monte).
+   In modalità tonale anche le correzioni per armonica, con l'attenuazione prevista per ogni armonica.
 7. **Verifica A/B** — confronto anti-rumore attivo/bypass e attenuazione misurata (larga banda e per terzi
-   d'ottava, con il mic d'errore).
+   d'ottava, con il mic d'errore; in modalità tonale anche a ogni armonica).
 
 Con una calibrazione salvata, all'avvio l'app chiede se hai spostato microfoni, casse o amplificatore:
 
@@ -309,7 +359,8 @@ Con una calibrazione salvata, all'avvio l'app chiede se hai spostato microfoni, 
   solo se la finestra dell'app ha il fuoco**: se stai usando un'altra finestra, agisci sull'amplificatore.
 - **`M`** = muto (rampa 15 ms), **`B`** = bypass A/B.
 - L'uscita resta **a zero** finché i dispositivi non sono validati; all'attivazione sale in 1,5 s. Ogni
-  aumento di guadagno oltre 6 dB (preset, valore digitato, doppio clic) sale al massimo di 6 dB/s.
+  aumento di guadagno oltre 6 dB (preset, valore digitato, doppio clic), anche delle correzioni per armonica,
+  sale al massimo di 6 dB/s.
 - **Cuffie**: tetto d'uscita **forzato a −24 dBFS**. Mai Bluetooth/AirPlay.
 - **Rilevatore di innesco** nel worklet (prima del limitatore): silenzia automaticamente e mostra la
   frequenza. Falsi positivi noti e accettati: un tono che sale molto in fretta, oppure un suono periodico
@@ -402,6 +453,12 @@ nella build Docker):
 - Modalità tonale: inseguimento automatico di f0 (un tono che deriva da 100 a 101 Hz in 10 s viene seguito
   entro 0,05 Hz a ogni stima, ogni 2 s); nessun inseguimento oltre il 3 %, con confidenza < 0,5, con il tono
   meno di 15 dB sopra il fondo, con l'inseguimento spento o fuori dalla modalità tonale.
+- Correzioni per armonica: con tutte a 0 il motore produce esattamente le uscite di prima (valori di riferimento
+  salvati, in tutte le modalità); la risposta a ogni armonica è quella richiesta e le armoniche non si
+  influenzano; gli aumenti oltre 6 dB salgono a 6 dB/s; i cambi non producono click (≤ −105 dB sopra 2 kHz);
+  il rilevatore di innesco funziona anche con le correzioni. Il margine di stabilità per armonica è verificato
+  su impianti casuali e nel simulatore (con feedback forte solo a 300 Hz l'attenuazione alle altre armoniche resta
+  51–59 dB invece di scendere a 6 dB); l'autotune segue la f0 che deriva e si ferma se salta del 2 %.
 - Simulatore ad anello chiuso con il vero motore DSP: calibrazione → risolutore → attenuazione attesa (anche
   con due casse sulla stessa zona), modalità tonale con f0 stimata su un tono stabile, neutralizzazione della
   retroazione, regolazione automatica con una cassa e con due casse sulla stessa zona (≥ 6 dB di
@@ -414,7 +471,11 @@ nella build Docker):
   aumento di guadagno di 20 dB, impulsi al tetto, parlato, rumore che sale come un veicolo che passa.
 - E2E in Chrome con microfono finto: contesto attivo, nessuna uscita prima della validazione, uscita =
   −g·riferimento ritardato (correlazione > 0,99), `Esc` → muto entro 50 ms, cambio dispositivo e traccia
-  fermata → silenziamento automatico, nessun errore del processore, clic reali sui pulsanti.
+  fermata → silenziamento automatico, nessun errore del processore, clic reali sui pulsanti. Correzioni per
+  armonica nel worklet reale (tono di 100 Hz con 3 armoniche): ogni correzione cambia solo la sua armonica e solo in
+  modalità tonale (entro 0,01 dB / 0,05°), «Collega L/R» e «Azzera armoniche», la fase totale mostrata contro
+  quella misurata, la salita da −30 a +6 dB a 6 dB/s, e un trascinamento veloce dei controlli a livello udibile
+  senza innesco né silenziamento.
 - Build: `tsc -b` e `vite build`; nella build Docker anche lo script del certificato e `nginx -t`.
 
 **Non ancora verificato automaticamente**:

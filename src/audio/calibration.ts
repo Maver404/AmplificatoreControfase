@@ -6,20 +6,21 @@
  * Pure TypeScript with no DOM access: the browser wizard, the analysis worker (welchTransfer) and the
  * Node closed-loop simulator all run this file unmodified.
  */
-import { loopGainDb, sampleResponse, solveAlignment } from '../dsp/alignment.ts';
+import { harmonicFactors, sampleResponse, solveAlignment } from '../dsp/alignment.ts';
 import type { AlignmentResult, ChannelSolution, FreqResponse, SpeakerConfig } from '../dsp/alignment.ts';
 import { FEEDBACK_MAX_TAPS } from '../dsp/antiphase-engine.ts';
 import type { Complex } from '../dsp/complex.ts';
 import type { F0Estimate } from '../dsp/f0-tracker.ts';
 import { designFeedbackFir } from '../dsp/feedback-canceller.ts';
 import { nextPow2, sharedFFT } from '../dsp/fft.ts';
+import { trimForTarget } from '../dsp/harmonic-trims.ts';
 import { hilbertResponse } from '../dsp/hilbert-pair.ts';
 import { combineEstimates, irToResponse } from '../dsp/latency-estimator.ts';
 import type { DelayEstimate } from '../dsp/latency-estimator.ts';
-import { D_MIN_SAMPLES, MASTER_MIN_DB, MAX_DELAY_MS, RANGES, clampParams } from '../dsp/params.ts';
+import { D_MIN_SAMPLES, MASTER_MIN_DB, MAX_DELAY_MS, MAX_HARMONICS as MAX_TRIMS, RANGES, clampParams, withoutTrims } from '../dsp/params.ts';
 import type { EngineParams } from '../dsp/params.ts';
 import { geometryDelay, headStartSeconds, speedOfSound } from '../dsp/physics.ts';
-import { channelResponse, conditioningResponse, groupDelaySamples } from '../dsp/response.ts';
+import { channelResponse, channelResponseAt, conditioningResponse, groupDelaySamples } from '../dsp/response.ts';
 import { exponentialSweep, mulberry32, pinkNoise } from '../dsp/sweep.ts';
 
 // ------------------------------------------------------------------ types
@@ -142,7 +143,9 @@ export interface SolveOutcome {
   /**
    * The solver's result. predictedAttenuationDb is recomputed for the returned params (after clamping
    * and the loop-gain limit) and, with an error mic, includes the part of the zone noise the
-   * reference does not hear (coherence): it is the attenuation the error mic can expect.
+   * reference does not hear (coherence): it is the attenuation the error mic can expect. When the params
+   * were left unchanged it is the prediction refused (below 1 dB, the figure the advice quotes): such an
+   * outcome is never useful (logic.ts usefulOutcome).
    */
   result: AlignmentResult;
   /** Italian, shown to the user. */
@@ -160,7 +163,63 @@ export interface SolveOutcome {
    * attenuation the params are left unchanged.
    */
   loopLimitedDb?: number;
+  /**
+   * Extension, tonal mode: the harmonics the trims act on (1 … tonal.harmonics, inside the calibration band and
+   * below 0.45·fs), with the prediction for the params returned. Absent outside tonal mode and when the
+   * params were left unchanged.
+   */
+  harmonics?: HarmonicSolution[];
+  /**
+   * Extension, tonal mode: the delay/gain/polarity solution alone (no trims, no centring raise) under its own
+   * stability margin, and its predicted attenuation: what the trims are compared with (result.predictedAttenuationDb
+   * is never below it; HarmonicSolution.untrimmedDb is its prediction per harmonic). Absent outside tonal mode, when
+   * the params were left unchanged and when the margin refused the delay alone.
+   */
+  delayOnly?: { params: EngineParams; predictedDb: number };
+  /**
+   * Extension: result.predictedAttenuationDb is at the ceiling of the solve model (predictionCeiling), not a
+   * precise figure. Absent otherwise.
+   */
+  predictionCeiling?: PredictionCeiling;
 }
+
+/** One harmonic of a tonal solution (SolveOutcome.harmonics). */
+export interface HarmonicSolution {
+  /** Harmonic number (ChannelParams.harmonicTrims[h − 1]) and its frequency h·f0, Hz. */
+  h: number;
+  freqHz: number;
+  /**
+   * Predicted attenuation at the error mic at this harmonic with the params returned (trims, clamping and the
+   * loop-gain limit included; with an error mic also the zone noise the reference does not hear), dB.
+   */
+  predictedDb: number;
+  /**
+   * The same for the delay/gain/polarity solution alone (no trims, no centring raise) under its own stability margin
+   * (its own cuts: uniform, or of the loop at this harmonic), dB: the fair comparison (SolveOutcome.delayOnly).
+   * predictedDb is below it only where giving this harmonic that response back would take the loop over the margin
+   * (and neither lowering this harmonic's trims into the margin predicts more there and in total, nor lowering every
+   * gain instead predicts more in total by at least the cut, GIVE_BACK_CUT_GAIN_DB = 0.05 dB at most) or needs a trim
+   * outside RANGES.trimGainDb. In separate zones played together (step 6) a zone may play its delay alone instead.
+   */
+  untrimmedDb: number;
+  /** The trim this harmonic needed was outside RANGES.trimGainDb and was clamped: partial cancellation. */
+  capped: boolean;
+  /**
+   * dB taken off this harmonic's trims (on the channels that feed back into the reference mic) so that the
+   * neutralised loop stays at LOOP_GAIN_DANGER_DB around its frequency; absent when none. The rest of the
+   * margin, taken off every channel gain, is SolveOutcome.loopLimitedDb.
+   */
+  loopLimitedDb?: number;
+  /** predictedDb is at the ceiling of the solve model (predictionCeiling), not a precise figure; absent otherwise. */
+  ceiling?: PredictionCeiling;
+}
+
+/**
+ * The ceiling a prediction reached (predictionCeiling): 'geometry' — without an error mic, the accuracy limit
+ * of the model (GEOMETRY_ACCURACY_DB); 'exact' — with one, an exact null of the measured model, which the
+ * calculation stops at EXACT_NULL_DB.
+ */
+export type PredictionCeiling = 'geometry' | 'exact';
 
 /** Extension options of the solvers. */
 export interface SolveOptions {
@@ -250,6 +309,27 @@ const LEVEL_GAIN_SIGMAS = 5;
 const LEVEL_CHECK_MIN_QUALITY_DB = 15;
 /** Bulk-delay search of a stored primary path (tonal mode), seconds either way. */
 const PRIMARY_BULK_MAX_S = 0.5;
+/**
+ * Without an error mic the solve model (geometric primary) has no measured incoherent part: a residual floor
+ * of GEOMETRY_ACCURACY_DB below the noise at every frequency (a few % of model error: a couple of cm of
+ * distance at 400 Hz) bounds its predictions at about that many dB, instead of the ~300 dB of an exact null
+ * of the model (per-harmonic trims null it exactly).
+ */
+export const GEOMETRY_ACCURACY_DB = 30;
+const GEOMETRY_FLOOR = Math.pow(10, -GEOMETRY_ACCURACY_DB / 10);
+/**
+ * A measured coherence is never taken as exactly 1: an exact null of the measured model (the per-harmonic
+ * trims make one) then predicts 60 dB, not an infinite attenuation (or 0 dB, read off a zero residual).
+ * Real Welch estimates stay well below it.
+ */
+const MAX_COHERENCE = 1 - 1e-6;
+/** The prediction of an exact null of the measured model: −10·log10(1 − MAX_COHERENCE) ≈ 60 dB. */
+export const EXACT_NULL_DB = -10 * Math.log10(1 - MAX_COHERENCE);
+/**
+ * Within this of its ceiling a prediction is the ceiling: the model's own residual is at most ~12 % of the
+ * floor that bounds it, so the figure says how far the model reaches, not how much the room will give.
+ */
+export const PREDICTION_CEILING_TOL_DB = 0.5;
 /** A coherence this low reads as "nothing coherent" (keeps Gyy = |H1|²·Gxx/γ² finite). */
 const MIN_COHERENCE = 1e-4;
 /** Below this predicted attenuation the solution is reported as weak; below MIN_USEFUL_DB it is not applied. */
@@ -272,6 +352,8 @@ const CH_NAME = ['L', 'R'] as const;
 
 const fmt = (x: number, digits = 1): string => x.toFixed(digits).replace('.', ',').replace('-', '−');
 const dbToAmp = (db: number): number => Math.pow(10, db / 20);
+/** A gain cut for the advice: «meno di 0,1» where one decimal would read 0,0 (a give-back's cut of a few 1e-5 dB). */
+const fmtCut = (db: number): string => (db < 0.05 ? 'meno di 0,1' : fmt(db));
 const store = (v: ArrayLike<number>): number[] => {
   const out = new Array<number>(v.length);
   for (let i = 0; i < v.length; i++) {
@@ -346,8 +428,21 @@ function harmonicFreqs(f0: number, band: [number, number], fs: number): Float64A
 
 /** Response of a stored path at `freqs`: exact DTFT of the stored IR window when present. */
 export function pathResponse(path: PathData, fs: number, freqs: Float64Array): FreqResponse {
-  if (path.ir.length > 0) {
-    const r = irToResponse(Float64Array.from(path.ir), fs, freqs);
+  return pathResponseAt(path, fs)(freqs);
+}
+
+/** pathResponse as a function of the frequencies, the stored IR converted once (evaluated again and again by the loop checks). */
+function pathResponseAt(path: PathData, fs: number): (freqs: Float64Array) => FreqResponse {
+  if (path.ir.length === 0) {
+    const stored = storedResponse(path);
+    return (freqs) => {
+      const s = sampleResponse(stored, freqs);
+      return { freqs, re: s.re, im: s.im };
+    };
+  }
+  const ir = Float64Array.from(path.ir);
+  return (freqs) => {
+    const r = irToResponse(ir, fs, freqs);
     const re = new Float64Array(freqs.length);
     const im = new Float64Array(freqs.length);
     for (let k = 0; k < freqs.length; k++) {
@@ -359,9 +454,7 @@ export function pathResponse(path: PathData, fs: number, freqs: Float64Array): F
       im[k] = r.re[k] * s + r.im[k] * c;
     }
     return { freqs, re, im };
-  }
-  const s = sampleResponse(storedResponse(path), freqs);
-  return { freqs, re: s.re, im: s.im };
+  };
 }
 
 const storedResponse = (r: { freqs: number[]; re: number[]; im: number[] }): FreqResponse => ({
@@ -1278,26 +1371,244 @@ export interface LoopGains {
   afterDb: number;
 }
 
-/** Open-loop gain of `p` through the measured feedback paths, raw and neutralised; null without data. */
-function loopGains(cal: CalibrationData, p: EngineParams, fs: number, taps: number): LoopGains | null {
+/**
+ * Frequencies the loop gain is checked at: the calibration grid and, in tonal mode, the centres of the
+ * harmonics the bank reproduces. There the channel response peaks (with its trim) in a band of h·f0/Q, at
+ * Q 30 narrower than the grid's 2 Hz cells: the grid alone can miss the top of the fundamental's peak by
+ * several dB.
+ */
+function loopFreqs(cal: CalibrationData, p: EngineParams, fs: number): Float64Array {
+  const grid = calibrationFreqs(fs, cal.band);
+  const q = clampParams(p);
+  if (q.phaseMode !== 'tonal' || grid.length === 0) return grid;
+  const band = normaliseBand(cal.band, fs);
+  if (band === null) return grid;
+  const peaks = Array.from(harmonicFreqs(q.tonal.f0, band, fs)).filter((f) => Math.round(f / q.tonal.f0) <= q.tonal.harmonics);
+  const all = [...grid, ...peaks].sort((a, b) => a - b);
+  return Float64Array.from(all.filter((f, i) => i === 0 || f - all[i - 1] > 1e-9 * f));
+}
+
+type FeedbackPair = [FreqResponse | null, FreqResponse | null];
+
+/**
+ * The measured feedback paths at any frequencies, raw and after neutralisation with the FIRs
+ * feedbackFirs(cal, taps) designs (F − F̂, designed once); null without feedback data or at another rate.
+ */
+function feedbackAt(cal: CalibrationData, fs: number, taps: number): ((freqs: Float64Array) => { raw: FeedbackPair; resid: FeedbackPair }) | null {
   if (cal.fs !== fs || (cal.feedback[0] === null && cal.feedback[1] === null)) return null;
-  const freqs = calibrationFreqs(fs, cal.band);
-  if (freqs.length === 0) return null;
-  const fb: [FreqResponse | null, FreqResponse | null] = [
-    cal.feedback[0] ? pathResponse(cal.feedback[0], fs, freqs) : null,
-    cal.feedback[1] ? pathResponse(cal.feedback[1], fs, freqs) : null,
-  ];
-  const g: [(f: number) => Complex, (f: number) => Complex] = [
-    (f) => channelResponse(p, fs, f, 0),
-    (f) => channelResponse(p, fs, f, 1),
-  ];
-  const raw = loopGainDb(g, fb, cal.band);
   const firs = feedbackFirs(cal, taps);
-  const resid: [FreqResponse | null, FreqResponse | null] = [
-    fb[0] && firs[0] ? minusFir(fb[0], firs[0], fs) : fb[0],
-    fb[1] && firs[1] ? minusFir(fb[1], firs[1], fs) : fb[1],
-  ];
-  return { rawDb: raw.maxDb, atHz: raw.atHz, afterDb: loopGainDb(g, resid, cal.band).maxDb };
+  const paths = [cal.feedback[0] ? pathResponseAt(cal.feedback[0], fs) : null, cal.feedback[1] ? pathResponseAt(cal.feedback[1], fs) : null];
+  return (freqs) => {
+    const raw: FeedbackPair = [paths[0]?.(freqs) ?? null, paths[1]?.(freqs) ?? null];
+    const resid: FeedbackPair = [
+      raw[0] && firs[0] ? minusFir(raw[0], firs[0], fs) : raw[0],
+      raw[1] && firs[1] ? minusFir(raw[1], firs[1], fs) : raw[1],
+    ];
+    return { raw, resid };
+  };
+}
+
+/** feedbackAt at `freqs`; null without feedback data, at another rate or without frequencies. */
+function neutralisedFeedback(cal: CalibrationData, freqs: Float64Array, fs: number, taps: number): { raw: FeedbackPair; resid: FeedbackPair } | null {
+  const at = freqs.length > 0 ? feedbackAt(cal, fs, taps) : null;
+  return at !== null ? at(freqs) : null;
+}
+
+/** Open-loop gain of `p` through the measured feedback paths, raw and neutralised (loopChecker); null without data. */
+function loopGains(cal: CalibrationData, p: EngineParams, fs: number, taps: number): LoopGains | null {
+  return loopChecker(cal, p, fs, taps)?.gains(p) ?? null;
+}
+
+/** Both channels' responses of some params as functions of f (response.ts channelResponseAt). */
+type ChannelResponses = [(f: number) => Complex, (f: number) => Complex];
+
+/** channelResponse of both channels of `p`, each prepared once for many frequencies. */
+const responsesOf = (p: EngineParams, fs: number): ChannelResponses => [channelResponseAt(p, fs, 0), channelResponseAt(p, fs, 1)];
+
+/** The neutralised loop |Σ G·(F − F̂)| of `p` at `freqs`, dB, from the residual paths `resid` on them. */
+function loopDbAt(p: EngineParams | ChannelResponses, fs: number, freqs: Float64Array, resid: FeedbackPair): Float64Array {
+  return loopsDbAt(Array.isArray(p) ? p : responsesOf(p, fs), freqs, [resid])[0];
+}
+
+/** loopDbAt through several pairs of paths at once (raw and neutralised), each channel response evaluated once per frequency. */
+function loopsDbAt(resp: ChannelResponses, freqs: Float64Array, pairs: FeedbackPair[]): Float64Array[] {
+  const db = pairs.map(() => new Float64Array(freqs.length).fill(-Infinity));
+  const used = ([0, 1] as const).map((ch) => pairs.some((x) => x[ch] !== null));
+  for (let k = 0; k < freqs.length; k++) {
+    const g = ([0, 1] as const).map((ch) => (used[ch] ? resp[ch](freqs[k]) : null));
+    pairs.forEach((pair, i) => {
+      let re = 0;
+      let im = 0;
+      for (const ch of [0, 1] as const) {
+        const r = pair[ch];
+        const v = g[ch];
+        if (r === null || v === null || !Number.isFinite(v.re) || !Number.isFinite(v.im)) continue;
+        re += v.re * r.re[k] - v.im * r.im[k];
+        im += v.re * r.im[k] + v.im * r.re[k];
+      }
+      const m = Math.hypot(re, im);
+      if (m > 0) db[i][k] = 20 * Math.log10(m);
+    });
+  }
+  return db;
+}
+
+/** Points per side of a harmonic's band where enforceLoopMargin samples the loop before refining its peak. */
+const TRIM_LOOP_POINTS = 8;
+/**
+ * A sampled loop peak further than this below the margin (a harmonic's band) or below the highest sample (the
+ * loop frequencies) is not refined: between samples ≤ 1/16 of a resonator's bandwidth, or 2.5 Hz on the
+ * calibration grid (whose feedback paths of ≤ 0.2 s ripple over ≥ 5 Hz), a peak hides well under 3 dB.
+ */
+const LOOP_REFINE_BELOW_DB = 3;
+/** At most this many of the loop frequencies' sampled peaks are refined (the highest). */
+const LOOP_REFINE_PEAKS = 8;
+
+/**
+ * Highest value of `one` between a and b (a sampled maximum `peak` between them): golden-section search down to
+ * 1/2000 of the interval (on a peak a few samples wide that reads its top within 1e-5 dB).
+ */
+function refinePeak(one: (f: number) => number, a: number, b: number, peak: number): number {
+  const g = (Math.sqrt(5) - 1) / 2;
+  const stop = (b - a) / 2000;
+  let x1 = b - g * (b - a);
+  let x2 = a + g * (b - a);
+  let f1 = one(x1);
+  let f2 = one(x2);
+  let top = Math.max(peak, f1, f2);
+  for (let i = 0; i < 30 && b - a > stop; i++) {
+    if (f1 > f2) {
+      b = x2;
+      x2 = x1;
+      f2 = f1;
+      x1 = b - g * (b - a);
+      f1 = one(x1);
+    } else {
+      a = x1;
+      x1 = x2;
+      f1 = f2;
+      x2 = a + g * (b - a);
+      f2 = one(x2);
+    }
+    top = Math.max(top, f1, f2);
+  }
+  return top;
+}
+
+/** The neutralised loop at one frequency, dB, of the params whose channel responses are `resp`. */
+function loopDbAtOne(resp: ChannelResponses, fs: number, at: (freqs: Float64Array) => { resid: FeedbackPair }, f: number): number {
+  const x = Float64Array.of(f);
+  return loopDbAt(resp, fs, x, at(x).resid)[0];
+}
+
+/** The 2·TRIM_LOOP_POINTS + 1 frequencies bandLoopPeakDb samples across [lo, hi], `centre` in the middle. */
+const bandFreqs = (centre: number, lo: number, hi: number): Float64Array =>
+  Float64Array.from({ length: 2 * TRIM_LOOP_POINTS + 1 }, (_, i) => {
+    const u = (i - TRIM_LOOP_POINTS) / TRIM_LOOP_POINTS;
+    return u < 0 ? centre + u * (centre - lo) : centre + u * (hi - centre);
+  });
+
+/**
+ * Peak of the neutralised loop of `p` across a harmonic's band (see trimLoopBands), dB: the band's samples
+ * (bandFreqs, with the residual feedback paths there), then a golden-section search between the neighbours of
+ * the highest one (the peak need not sit on the centre when F̃ slopes there, and the loop grid's 2 Hz cells are
+ * wider than the top of a Q 30 peak).
+ */
+function bandLoopPeakDb(
+  p: EngineParams,
+  fs: number,
+  at: (freqs: Float64Array) => { resid: FeedbackPair },
+  samples: { freqs: Float64Array; resid: FeedbackPair },
+): number {
+  const freqs = samples.freqs;
+  const resp = responsesOf(p, fs);
+  const db = loopDbAt(resp, fs, freqs, samples.resid);
+  let best = 0;
+  for (let i = 1; i < db.length; i++) if (db[i] > db[best]) best = i;
+  if (!(db[best] > LOOP_GAIN_DANGER_DB - LOOP_REFINE_BELOW_DB)) return db[best];
+  const a = freqs[Math.max(0, best - 1)];
+  const b = freqs[Math.min(freqs.length - 1, best + 1)];
+  return refinePeak((f) => loopDbAtOne(resp, fs, at, f), a, b, db[best]);
+}
+
+/** Single frequencies whose feedback paths a loopChecker keeps (a few thousand per solve). */
+const LOOP_VISITED_MAX = 16384;
+
+/** The loop of params that share f0 and the harmonics (the loop-check frequencies) with those it was made for. */
+interface LoopChecker {
+  /** Loop gains of `q`: raw at its maximum on the loop frequencies, neutralised at its maximum refined between them. */
+  gains(q: EngineParams): LoopGains;
+  /** The neutralised peak of `q` across one harmonic's band (bandLoopPeakDb). */
+  bandPeak(q: EngineParams, b: { centre: number; lo: number; hi: number }): number;
+}
+
+/**
+ * The loop check of params like `p` (same f0 and harmonics: the frequencies loopFreqs gives), with the
+ * neutralisation FIRs designed and the feedback paths evaluated once. The neutralised maximum is refined
+ * between the loop frequencies around the highest sampled peaks (within LOOP_REFINE_BELOW_DB of the highest,
+ * LOOP_REFINE_PEAKS at most; golden section): on the calibration grid alone a peak between two harmonics'
+ * bands read up to 0.1 dB low, 0.3 dB once separate zones played together, so a loop capped to the grid's
+ * maximum still exceeded the margin there. Relative to the highest sample, the result scales exactly with the
+ * gains (a cap lands where it aims). The feedback paths at the single frequencies the refinements visit are kept:
+ * the golden-section searches of one solve's many checks revisit the same ones (a few thousand per solve, mostly
+ * hits; the solves of the review's heaviest seeded plants took half the time). Null without feedback data, at
+ * another rate or without frequencies.
+ */
+function loopChecker(cal: CalibrationData, p: EngineParams, fs: number, taps: number): LoopChecker | null {
+  const all = loopFreqs(cal, p, fs);
+  const lo = Math.min(cal.band[0], cal.band[1]);
+  const hi = Math.max(cal.band[0], cal.band[1]);
+  const freqs = all.filter((f) => f >= lo && f <= hi);
+  const paths = freqs.length > 0 ? feedbackAt(cal, fs, taps) : null;
+  if (paths === null) return null;
+  const fb = paths(freqs);
+  const visited = new Map<number, { raw: FeedbackPair; resid: FeedbackPair }>();
+  const at = (x: Float64Array): { raw: FeedbackPair; resid: FeedbackPair } => {
+    if (x.length !== 1) return paths(x);
+    let v = visited.get(x[0]);
+    if (v === undefined) {
+      if (visited.size >= LOOP_VISITED_MAX) visited.clear();
+      v = paths(x);
+      visited.set(x[0], v);
+    }
+    return v;
+  };
+  // Each band's samples (bandLoopPeakDb) and the feedback paths there, evaluated once.
+  const bandSamples = new Map<string, { freqs: Float64Array; resid: FeedbackPair }>();
+  return {
+    gains(q) {
+      const resp = responsesOf(q, fs);
+      const [raw, after] = loopsDbAt(resp, freqs, [fb.raw, fb.resid]);
+      let r = 0;
+      let top = -Infinity;
+      for (let k = 0; k < freqs.length; k++) {
+        if (raw[k] > raw[r]) r = k;
+        top = Math.max(top, after[k]);
+      }
+      const peaks: number[] = [];
+      for (let k = 0; k < freqs.length; k++) {
+        const v = after[k];
+        if ((k === 0 || v >= after[k - 1]) && (k === freqs.length - 1 || v >= after[k + 1]) && v > top - LOOP_REFINE_BELOW_DB) peaks.push(k);
+      }
+      let peak = top;
+      for (const k of peaks.sort((a, b) => after[b] - after[a]).slice(0, LOOP_REFINE_PEAKS)) {
+        const a = freqs[Math.max(0, k - 1)];
+        const b = freqs[Math.min(freqs.length - 1, k + 1)];
+        if (b > a) peak = Math.max(peak, refinePeak((f) => loopDbAtOne(resp, fs, at, f), a, b, after[k]));
+      }
+      return { rawDb: raw[r], atHz: freqs[r], afterDb: peak };
+    },
+    bandPeak(q, b) {
+      const key = `${b.centre}|${b.lo}|${b.hi}`;
+      let x = bandSamples.get(key);
+      if (x === undefined) {
+        const f = bandFreqs(b.centre, b.lo, b.hi);
+        x = { freqs: f, resid: at(f).resid };
+        bandSamples.set(key, x);
+      }
+      return bandLoopPeakDb(q, fs, at, x);
+    },
+  };
 }
 
 /**
@@ -1379,7 +1690,8 @@ function causalityAdvice(result: AlignmentResult, extraS: number, tempC: number,
 /**
  * What the solver aligned (on its own frequencies), for the attenuation the returned params give:
  * `weights` are the reference PSD (error mic) or |H_cond|² (geometry), `coherence` the primary
- * coherence (null: the model is exact).
+ * coherence (null: the model is exact), `feedback` the feedback paths after neutralisation F̃ = F − F̂
+ * (null without feedback data: an open loop).
  */
 interface SolveModel {
   freqs: Float64Array;
@@ -1388,45 +1700,274 @@ interface SolveModel {
   weights: Float64Array;
   coherence: Float64Array | null;
   band: [number, number];
+  feedback: FeedbackPair | null;
+}
+
+/** `m` with the neutralised feedback paths the app loads (feedbackFirs(cal, taps)) on its frequencies. */
+const withFeedback = (m: SolveModel, cal: CalibrationData, fs: number, taps: number): SolveModel => ({
+  ...m,
+  feedback: neutralisedFeedback(cal, m.freqs, fs, taps)?.resid ?? null,
+});
+
+/** Below this |1 − L| the closed loop has no steady state to predict (L: the loop gain): the point counts as uncancelled. */
+const LOOP_POLE_EPS = 1e-12;
+
+/** The prediction `db` at the ceiling of its model (with or without an error mic), or null (an ordinary figure). */
+export function predictionCeiling(db: number, errorMic: boolean): PredictionCeiling | null {
+  if (!Number.isFinite(db)) return null;
+  if (errorMic) return db >= EXACT_NULL_DB - PREDICTION_CEILING_TOL_DB ? 'exact' : null;
+  return db >= GEOMETRY_ACCURACY_DB - PREDICTION_CEILING_TOL_DB ? 'geometry' : null;
 }
 
 /**
- * Attenuation at the error mic with the channel responses of `p`. Residual R = P + Σ G_ch·S_ch per
- * frequency. With the coherence γ² of the primary measurement, the error-mic power per frequency is
- * Gyy = |P|²·Gxx/γ², of which only the coherent part γ²·Gyy can be cancelled:
- * A = −10·log10(Σ (|R|²·Gxx + (1 − γ²)·Gyy) / Σ Gyy). Without coherence: Σ w|R|² / Σ w|P|².
+ * Attenuation at the error mic with the channel responses of `p`. Residual R = P + Σ G_ch·S_ch/(1 − L) per
+ * frequency, L = Σ G_ch·F̃_ch the neutralised loop: the reference mic hears the noise plus what the speakers
+ * feed back past the neutraliser, so the anti-noise is the open-loop one × 1/(1 − L) (without feedback data
+ * L = 0). At the −6 dB margin that is −3.5…+6 dB, enough to undo a null. With the coherence γ² of the
+ * primary measurement, the error-mic power per frequency is Gyy = |P|²·Gxx/γ², of which only the coherent
+ * part γ²·Gyy can be cancelled: A = −10·log10(Σ (|R|²·Gxx + (1 − γ²)·Gyy) / Σ Gyy). Without coherence (no
+ * error mic): Σ w·(|R|² + 10^(−GEOMETRY_ACCURACY_DB/10)·|P|²) / Σ w|P|², at most GEOMETRY_ACCURACY_DB.
  */
 function predictedAttenuationDb(m: SolveModel, p: EngineParams, fs: number): number {
   let num = 0;
   let den = 0;
+  const resp = responsesOf(p, fs);
   for (let k = 0; k < m.freqs.length; k++) {
-    const f = m.freqs[k];
-    const w = m.weights[k];
-    if (f < m.band[0] || f > m.band[1] || !(w > 0)) continue;
-    const pr = m.primary.re[k];
-    const pi = m.primary.im[k];
-    let rr = pr;
-    let ri = pi;
-    for (const ch of [0, 1] as const) {
-      const s = m.secondary[ch];
-      if (s === null) continue;
-      const g = channelResponse(p, fs, f, ch);
-      rr += g.re * s.re[k] - g.im * s.im[k];
-      ri += g.re * s.im[k] + g.im * s.re[k];
-    }
-    const pp = pr * pr + pi * pi;
-    const r2 = rr * rr + ri * ri;
-    if (m.coherence === null) {
-      num += w * r2;
-      den += w * pp;
-    } else {
-      const c = Math.min(1, Math.max(MIN_COHERENCE, m.coherence[k]));
-      const gyy = (pp * w) / c;
-      num += r2 * w + (1 - c) * gyy;
-      den += gyy;
-    }
+    const t = residualTerms(m, resp, k);
+    if (t === null) continue;
+    num += t.num;
+    den += t.den;
   }
   return den > 0 && num > 0 ? -10 * Math.log10(num / den) : 0;
+}
+
+/**
+ * Residual (num) and noise (den) power of predictedAttenuationDb at grid point k, with the channel responses
+ * `resp` (responsesOf the params); null outside the band or weightless.
+ */
+function residualTerms(m: SolveModel, resp: ChannelResponses, k: number): { num: number; den: number } | null {
+  const f = m.freqs[k];
+  const w = m.weights[k];
+  if (f < m.band[0] || f > m.band[1] || !(w > 0)) return null;
+  const pr = m.primary.re[k];
+  const pi = m.primary.im[k];
+  // Σ G·S (the open-loop anti-noise at the error mic) and 1 − L.
+  let ar = 0;
+  let ai = 0;
+  let dr = 1;
+  let di = 0;
+  for (const ch of [0, 1] as const) {
+    const s = m.secondary[ch];
+    const fb = m.feedback?.[ch] ?? null;
+    if (s === null && fb === null) continue;
+    const g = resp[ch](f);
+    if (s !== null) {
+      ar += g.re * s.re[k] - g.im * s.im[k];
+      ai += g.re * s.im[k] + g.im * s.re[k];
+    }
+    if (fb !== null) {
+      dr -= g.re * fb.re[k] - g.im * fb.im[k];
+      di -= g.re * fb.im[k] + g.im * fb.re[k];
+    }
+  }
+  const d2 = dr * dr + di * di;
+  let rr = pr;
+  let ri = pi;
+  if (d2 > LOOP_POLE_EPS * LOOP_POLE_EPS) {
+    rr += (ar * dr + ai * di) / d2;
+    ri += (ai * dr - ar * di) / d2;
+  }
+  const pp = pr * pr + pi * pi;
+  const r2 = rr * rr + ri * ri;
+  // No error mic: the model (pure-delay primary, measured or geometric secondary) is exact only on paper.
+  if (m.coherence === null) return { num: w * (r2 + pp * GEOMETRY_FLOOR), den: w * pp };
+  const c = Math.min(MAX_COHERENCE, Math.max(MIN_COHERENCE, m.coherence[k]));
+  const gyy = (pp * w) / c;
+  return { num: r2 * w + (1 - c) * gyy, den: gyy };
+}
+
+/** Attenuation of predictedAttenuationDb at grid point k alone, dB (0 when it cannot be computed). */
+function pointAttenuationDb(m: SolveModel, p: EngineParams, fs: number, k: number): number {
+  const t = residualTerms(m, responsesOf(p, fs), k);
+  return t !== null && t.den > 0 && t.num > 0 ? -10 * Math.log10(t.num / t.den) : 0;
+}
+
+/** The harmonics h ≤ tonal.harmonics (and ≤ MAX_TRIMS) below 0.45·fs on the solver's grid, with their grid index. */
+function trimmedHarmonics(p: EngineParams, m: SolveModel, fs: number): { h: number; k: number }[] {
+  const f0 = p.tonal.f0;
+  const out: { h: number; k: number }[] = [];
+  for (let h = 1; h <= Math.min(p.tonal.harmonics, MAX_TRIMS) && h * f0 < 0.45 * fs; h++) {
+    const f = h * f0;
+    let k = -1;
+    for (let i = 0; i < m.freqs.length && k < 0; i++) if (Math.abs(m.freqs[i] - f) <= 1e-9 * f) k = i;
+    if (k >= 0 && m.freqs[k] >= m.band[0] && m.freqs[k] <= m.band[1]) out.push({ h, k });
+  }
+  return out;
+}
+
+/**
+ * Tonal mode: per-harmonic trims of the solved params (delay, gain and polarity already chosen) that null
+ * the modelled residual at each harmonic (alignment.ts harmonicFactors: one speaker per zone exactly, two on
+ * one zone with the minimum change). The trims of different harmonics do not interact, so each is computed
+ * on its own from the untrimmed channel response there. The null is the closed loop's (see residualTerms):
+ * p + Σ T·b/(1 − Σ T·ℓ) = 0, ℓ_ch = G_ch·F̃_ch, is p + Σ T·(b − p·ℓ) = 0, so the factors are solved against
+ * the contributions b − p·ℓ (b alone without feedback data). With `centre`, a channel whose harmonics need more
+ * than RANGES.trimGainDb.max gets its gain raised by the excess and its trims lowered by as much, so the
+ * trims stay centred — only for harmonics the raise brings into range (as far as the channel gain range
+ * allows): raising the gain for a harmonic that stays out of range anyway (a speaker notch) would buy a
+ * fraction of a dB there with the whole raise of loop gain at that harmonic. What is still out of range is
+ * clamped (capped). A harmonic whose trims would leave a larger modelled residual than none (possible only
+ * when clamped) keeps them at 0, as does one without weight (no coherent noise to cancel). A clamp is not
+ * reported (capped) on a harmonic whose primary coherence is below LOW_COHERENCE: little of the noise there
+ * comes from the reference, so the trim that nulls the model is no statement about the speaker. Returns the
+ * params and the capped harmonics.
+ */
+function solveHarmonicTrims(
+  p: EngineParams,
+  m: SolveModel,
+  speakers: SpeakerConfig,
+  fs: number,
+  centre: boolean,
+): { params: EngineParams; capped: Set<number> } {
+  const q = withoutTrims(p);
+  const capped = new Set<number>();
+  const rows = trimmedHarmonics(q, m, fs).filter((r) => m.weights[r.k] > 0);
+  if (rows.length === 0) return { params: q, capped };
+  const r = RANGES.trimGainDb;
+  const factorsAt = (bounds: { min: number; max: number }): ReturnType<typeof harmonicFactors>[] =>
+    rows.map(({ h, k }) => {
+      const f = h * q.tonal.f0;
+      const pr = m.primary.re[k];
+      const pi = m.primary.im[k];
+      const b = ([0, 1] as const).map((ch): Complex | null => {
+        const s = m.secondary[ch];
+        if (s === null || !q.channels[ch].enabled) return null;
+        const g = channelResponse(q, fs, f, ch);
+        const v = { re: g.re * s.re[k] - g.im * s.im[k], im: g.re * s.im[k] + g.im * s.re[k] };
+        const fb = m.feedback?.[ch] ?? null;
+        if (fb === null) return v;
+        // − p·ℓ: the share of the anti-noise that comes back through the reference mic.
+        const lr = g.re * fb.re[k] - g.im * fb.im[k];
+        const li = g.re * fb.im[k] + g.im * fb.re[k];
+        return { re: v.re - (pr * lr - pi * li), im: v.im - (pr * li + pi * lr) };
+      }) as [Complex | null, Complex | null];
+      return harmonicFactors({ re: pr, im: pi }, b, speakers, bounds);
+    });
+  // Centring: a channel gain low enough that a harmonic needs more than the trims' maximum moves up, by
+  // what the harmonics the raise can bring into range need.
+  const gainMax = q.gainUnlocked ? RANGES.gainDb.maxUnlocked : RANGES.gainDb.max;
+  const free = centre ? factorsAt({ min: 0, max: Infinity }) : [];
+  for (const ch of [0, 1] as const) {
+    const room = gainMax - q.channels[ch].gainDb;
+    let raise = 0;
+    for (const fct of free) {
+      const t = fct.t[ch];
+      if (t === null) continue;
+      const over = 20 * Math.log10(Math.hypot(t.re, t.im)) - r.max;
+      if (over <= room + 1e-9) raise = Math.max(raise, over);
+    }
+    if (raise > 0 && Number.isFinite(raise)) q.channels[ch].gainDb += Math.min(raise, room);
+  }
+  const bounded = factorsAt({ min: dbToAmp(r.min), max: dbToAmp(r.max) });
+  const one: Complex = { re: 1, im: 0 };
+  rows.forEach(({ h, k }, i) => {
+    const clamped = bounded[i].capped[0] || bounded[i].capped[1];
+    const before = clamped ? pointAttenuationDb(m, q, fs, k) : 0;
+    for (const ch of [0, 1] as const) {
+      const t = bounded[i].t[ch];
+      if (t !== null) q.channels[ch].harmonicTrims[h - 1] = trimForTarget(t, one);
+    }
+    if (!clamped) return;
+    if (m.coherence === null || m.coherence[k] >= LOW_COHERENCE) capped.add(h);
+    if (pointAttenuationDb(m, q, fs, k) < before) {
+      // Clamped trims that would leave this harmonic worse than none: none.
+      for (const ch of [0, 1] as const) q.channels[ch].harmonicTrims[h - 1] = { gainDb: 0, phaseDeg: 0 };
+    }
+  });
+  return { params: clampParams(q), capped };
+}
+
+/** One harmonic whose trims the stability margin lowered: the neutralised loop around it before, and the dB taken off. */
+interface TrimLoopLimit {
+  loopDb: number;
+  loweredDb: number;
+}
+
+/**
+ * Per-harmonic prediction of the params returned (SolveOutcome.harmonics); untrimmedDb from `delayOnly`, the delay
+ * alone under its own margin (null: `p` without trims).
+ */
+function harmonicSolutions(
+  p: EngineParams,
+  m: SolveModel,
+  fs: number,
+  capped: Set<number>,
+  lowered: ReadonlyMap<number, TrimLoopLimit>,
+  delayOnly: EngineParams | null,
+): HarmonicSolution[] {
+  const bare = delayOnly ?? withoutTrims(p);
+  return trimmedHarmonics(p, m, fs).map(({ h, k }) => {
+    const x: HarmonicSolution = {
+      h,
+      freqHz: m.freqs[k],
+      predictedDb: pointAttenuationDb(m, p, fs, k),
+      untrimmedDb: pointAttenuationDb(m, bare, fs, k),
+      capped: capped.has(h),
+    };
+    const l = lowered.get(h);
+    if (l !== undefined) x.loopLimitedDb = l.loweredDb;
+    const c = predictionCeiling(x.predictedDb, m.coherence !== null);
+    if (c !== null) x.ceiling = c;
+    return x;
+  });
+}
+
+/** "a", "a e b", "a, b e c". */
+const joinList = (v: string[]): string => (v.length > 1 ? `${v.slice(0, -1).join(', ')} e ${v[v.length - 1]}` : (v[0] ?? ''));
+
+/**
+ * Italian advice on an applied prediction below WEAK_ATTENUATION_DB, null above it (step 6 restates it for separate
+ * zones merged).
+ */
+export function weakAttenuationAdvice(predictedDb: number): string | null {
+  if (!(predictedDb < WEAK_ATTENUATION_DB)) return null;
+  return `Attenuazione prevista solo ${fmt(predictedDb)} dB: controlla posizionamento, banda dei filtri e causalità prima di attivare l'uscita.`;
+}
+
+/** Italian advice on the harmonics whose trim was clamped, null when none (step 6 restates it for separate zones merged). */
+export function cappedAdvice(list: readonly HarmonicSolution[]): string | null {
+  const c = list.filter((x) => x.capped);
+  if (c.length === 0) return null;
+  const many = c.length > 1;
+  return (
+    `${many ? 'Armoniche' : 'Armonica'} ${joinList(c.map((x) => String(x.h)))} (${joinList(c.map((x) => fmt(x.freqHz, 0)))} Hz): ` +
+    `la correzione necessaria esce dal campo del ritocco per armonica (${fmt(RANGES.trimGainDb.min, 0)}…+${fmt(RANGES.trimGainDb.max, 0)} dB), ` +
+    `attenuazione prevista ${joinList(c.map((x) => fmt(x.predictedDb)))} dB. Controlla la cassa e la sua posizione a ` +
+    `${many ? 'quelle frequenze' : 'quella frequenza'}.`
+  );
+}
+
+/**
+ * Italian advice on the harmonics whose trims the stability margin lowered, null when none. `uniformDb`: what the
+ * margin then took off every channel gain as well (the other harmonics lost it too). «le altre armoniche non
+ * cambiano» only when that is true: no uniform cut, and some trimmed harmonic left as it was.
+ */
+function loopTrimAdvice(list: HarmonicSolution[], lowered: ReadonlyMap<number, TrimLoopLimit>, taps: number, uniformDb: number): string | null {
+  const c = list.filter((x) => x.loopLimitedDb !== undefined && lowered.has(x.h));
+  if (c.length === 0) return null;
+  const many = c.length > 1;
+  const others = uniformDb > 0
+    ? `, oltre alla riduzione di ${fmtCut(uniformDb)} dB dei guadagni dei canali`
+    : '';
+  const rest = uniformDb === 0 && list.some((x) => !lowered.has(x.h)) ? '; le altre armoniche non cambiano' : '';
+  return (
+    `${many ? 'Armoniche' : 'Armonica'} ${joinList(c.map((x) => String(x.h)))} (${joinList(c.map((x) => fmt(x.freqHz, 0)))} Hz): ` +
+    `guadagno d'anello cassa → microfono di riferimento ${joinList(c.map((x) => fmt(lowered.get(x.h)!.loopDb)))} dB dopo la ` +
+    `neutralizzazione del feedback, sopra ${fmt(LOOP_GAIN_DANGER_DB, 0)} dB: per la stabilità ` +
+    `${many ? 'le correzioni di queste armoniche sono state ridotte' : "la correzione dell'armonica è stata ridotta"} di ` +
+    `${joinList(c.map((x) => fmt(x.loopLimitedDb!)))} dB${others} (attenuazione prevista ${joinList(c.map((x) => fmt(x.predictedDb)))} dB)` +
+    `${rest}. Per recuperare attenuazione allontana o orienta la cassa lontano dal microfono di riferimento${tapsAdvice(taps)}.`
+  );
 }
 
 /** Every enabled channel gain lowered by `db`; null when one would fall below the gain range. */
@@ -1441,15 +1982,546 @@ function lowerGains(p: EngineParams, db: number): EngineParams | null {
   return clampParams(q);
 }
 
+/** Passes of the per-harmonic loop margin: off its centre a band's loop follows its trim only nearly. */
+const TRIM_LOOP_PASSES = 4;
+
+/**
+ * Tonal mode: the harmonics whose trims act (h ≤ tonal.harmonics and MAX_TRIMS, inside the calibration band,
+ * below 0.45·fs), each with the stretch of the band its resonator dominates: within h·f0/(2Q) (the
+ * resonator's half bandwidth) and f0/2 (half way to the neighbours) of h·f0, inside the calibration band.
+ */
+function trimLoopBands(cal: CalibrationData, q: EngineParams, fs: number): { h: number; centre: number; lo: number; hi: number }[] {
+  const band = normaliseBand(cal.band, fs);
+  if (q.phaseMode !== 'tonal' || band === null) return [];
+  const f0 = q.tonal.f0;
+  return Array.from(harmonicFreqs(f0, band, fs)).flatMap((f) => {
+    const h = Math.round(f / f0);
+    if (h > Math.min(q.tonal.harmonics, MAX_TRIMS) || !(f < 0.45 * fs)) return [];
+    const half = Math.min(f / (2 * q.tonal.q), f0 / 2);
+    return [{ h, centre: f, lo: Math.max(band[0], f - half), hi: Math.min(band[1], f + half) }];
+  });
+}
+
+/** finishSolve's stability margin applied to some params (enforceLoopMargin). */
+interface LoopMargin {
+  /** The params within the margin; null when the channel gains would have to fall below their range. */
+  params: EngineParams | null;
+  /** Tonal mode: the harmonics whose trims stay lowered (by loweredDb, net of what was given back). */
+  trims: Map<number, TrimLoopLimit>;
+  /** Loop once the trims were lowered, before the gains are (null without feedback data). */
+  rest: LoopGains | null;
+  /** dB taken off every channel gain for what the trims could not take (0 = none). */
+  limitedDb: number;
+  /** Loop of `params` (null without feedback data or params). */
+  final: LoopGains | null;
+}
+
+/** Halvings tried when a trim cut given back after the uniform cut would put the loop over the margin again. */
+const GIVE_BACK_TRIES = 3;
+/** Below this uniform cut nothing is given back: a harmonic would get back less than it, a few hundredths of a dB. */
+const GIVE_BACK_MIN_DB = 0.1;
+
+/**
+ * The solvers' stability margin: the neutralised loop of the params returned stays at or below
+ * LOOP_GAIN_DANGER_DB in band (with capLoopGain's rounding allowance, so that capping them again changes
+ * nothing; a sampled check: the loop frequencies with the highest peaks refined between them, and each
+ * harmonic's band finely, see loopChecker). In tonal mode (`perHarmonic`) a harmonic whose loop is above it
+ * first has its own trims lowered, on the channels that feed back into the reference mic, by just the
+ * excess (to the trims' floor at most): at h·f0 the loop scales with the trim exactly, and the other
+ * harmonics keep their cancellation (a uniform cut of every gain would cost them all of it for one harmonic's
+ * feedback). Each harmonic's band is searched for its peak (bandLoopPeakDb), and a few passes cover a peak off
+ * the centre, where the loop follows the trim only nearly (the bank's other bands). Through the closed loop a
+ * weakened anti-noise can add to the noise (the loop's phase): a harmonic the cut would leave louder than with
+ * those trims at their floor gets the floor (a lower loop still). What is left (between the harmonics, a trim
+ * at its floor, or outside tonal mode) is taken off every channel gain: the loop scales with them. That cut
+ * lowers the harmonics already cut as well, so each gets back as much of its own cut as the margin then
+ * allows (largest gain at its harmonic first, verified on the whole loop): no harmonic is cut twice.
+ */
+function enforceLoopMargin(
+  cal: CalibrationData,
+  p: EngineParams,
+  fs: number,
+  taps: number,
+  model: SolveModel,
+  perHarmonic = true,
+  checker?: LoopChecker | null,
+): LoopMargin {
+  const start = clampParams(p);
+  const q = clampParams(p);
+  const trims = new Map<number, TrimLoopLimit>();
+  const lc = checker !== undefined ? checker : loopChecker(cal, q, fs, taps);
+  if (lc === null) return { params: q, trims, rest: null, limitedDb: 0, final: null };
+  const bands = perHarmonic ? trimLoopBands(cal, q, fs) : [];
+  const fed = ([0, 1] as const).filter((ch) => cal.feedback[ch] !== null && q.channels[ch].enabled);
+  const floor = RANGES.trimGainDb.min;
+  const above = (db: number): boolean => db > LOOP_GAIN_DANGER_DB + LOOP_CAP_TOL_DB;
+  for (let pass = 0; pass < TRIM_LOOP_PASSES && bands.length > 0 && fed.length > 0; pass++) {
+    let changed = false;
+    for (const b of bands) {
+      const peak = lc.bandPeak(q, b);
+      if (!above(peak)) continue;
+      const step = peak - LOOP_GAIN_DANGER_DB + LOOP_CAP_TOL_DB / 2;
+      for (const ch of fed) {
+        const t = q.channels[ch].harmonicTrims[b.h - 1];
+        const g = Math.max(floor, t.gainDb - step);
+        if (g < t.gainDb) changed = true;
+        t.gainDb = g;
+      }
+      if (!trims.has(b.h)) trims.set(b.h, { loopDb: peak, loweredDb: 0 });
+    }
+    if (!changed) break;
+  }
+  const rows = new Map(trimmedHarmonics(q, model, fs).map((r) => [r.h, r.k]));
+  for (const h of trims.keys()) {
+    const k = rows.get(h);
+    if (k === undefined) continue;
+    const floored = clampParams(q);
+    for (const ch of fed) floored.channels[ch].harmonicTrims[h - 1].gainDb = floor;
+    if (pointAttenuationDb(model, floored, fs, k) > pointAttenuationDb(model, q, fs, k)) {
+      for (const ch of fed) q.channels[ch].harmonicTrims[h - 1].gainDb = floor;
+    }
+  }
+  const settle = (from: EngineParams): void => {
+    for (const [h, t] of trims) {
+      t.loweredDb = Math.max(...fed.map((ch) => start.channels[ch].harmonicTrims[h - 1].gainDb - from.channels[ch].harmonicTrims[h - 1].gainDb));
+      if (!(t.loweredDb > LOOP_CAP_TOL_DB)) trims.delete(h);
+    }
+  };
+  settle(q);
+  const rest = lc.gains(q);
+  if (!above(rest.afterDb)) return { params: q, trims, rest, limitedDb: 0, final: rest };
+  const limitedDb = rest.afterDb - LOOP_GAIN_DANGER_DB + LOOP_CAP_TOL_DB / 2;
+  let cur = lowerGains(q, limitedDb);
+  if (cur === null) return { params: null, trims, rest, limitedDb, final: null };
+  // The uniform cut lowered the harmonics cut before it too: give their own cuts back where the margin allows.
+  // Each give-back is checked on its own band and the neighbours' (the rest of the loop barely moves), the
+  // result on the whole loop; when that fails, again with every give-back checked on the whole loop.
+  if (!(limitedDb >= GIVE_BACK_MIN_DB)) return { params: cur, trims, rest, limitedDb, final: lc.gains(cur) };
+  const uniform = cur;
+  const within = (x: EngineParams): boolean => !bands.some((b) => above(lc.bandPeak(x, b))) && !above(lc.gains(x).afterDb);
+  const near = (x: EngineParams, h: number): boolean => !bands.some((b) => Math.abs(b.h - h) <= 1 && above(lc.bandPeak(x, b)));
+  const raised = (x: EngineParams, h: number, db: number): EngineParams => {
+    const y = clampParams(x);
+    for (const ch of fed) {
+      const t = y.channels[ch].harmonicTrims[h - 1];
+      t.gainDb = Math.min(start.channels[ch].harmonicTrims[h - 1].gainDb, t.gainDb + db);
+    }
+    return clampParams(y);
+  };
+  const gainAt = (x: EngineParams, h: number): number => pointAttenuationDb(model, x, fs, rows.get(h)!);
+  const order = [...trims.keys()]
+    .filter((h) => rows.has(h) && bands.some((b) => b.h === h))
+    .map((h) => ({ h, gain: gainAt(raised(cur!, h, Infinity), h) - gainAt(cur!, h) }))
+    .filter((x) => x.gain > 0)
+    .sort((a, b) => b.gain - a.gain);
+  const giveBack = (check: (x: EngineParams, h: number) => boolean): EngineParams => {
+    let x = uniform;
+    for (const { h } of order) {
+      const b = bands.find((y) => y.h === h)!;
+      let up = Math.min(trims.get(h)!.loweredDb, LOOP_GAIN_DANGER_DB - LOOP_CAP_TOL_DB / 2 - lc.bandPeak(x, b));
+      for (let i = 0; i < GIVE_BACK_TRIES && up > 1e-3; i++, up /= 2) {
+        const next = raised(x, h, up);
+        if (!(gainAt(next, h) > gainAt(x, h))) break;
+        if (check(next, h)) {
+          x = next;
+          break;
+        }
+      }
+    }
+    return x;
+  };
+  cur = giveBack(near);
+  if (cur !== uniform && !within(cur)) cur = giveBack(within);
+  settle(cur);
+  return { params: cur, trims, rest, limitedDb, final: lc.gains(cur) };
+}
+
+/**
+ * The stability margin that keeps more attenuation: enforceLoopMargin per harmonic, or with the uniform cut
+ * alone. The per-harmonic cut usually wins by far, but a peak off a harmonic's centre that its neighbours'
+ * skirts feed too needs a deeper trim cut than the uniform excess, and that can cost more in total.
+ */
+function bestLoopMargin(cal: CalibrationData, p: EngineParams, fs: number, taps: number, model: SolveModel, checker?: LoopChecker | null): LoopMargin {
+  const lc = checker !== undefined ? checker : loopChecker(cal, p, fs, taps);
+  const per = enforceLoopMargin(cal, p, fs, taps, model, true, lc);
+  if (per.trims.size === 0) return per;
+  const uniform = enforceLoopMargin(cal, p, fs, taps, model, false, lc);
+  return marginScore(uniform, model, fs) > marginScore(per, model, fs) ? uniform : per;
+}
+
+/** Predicted attenuation once the stability margin `m` is enforced (−∞: refused). */
+const marginScore = (m: LoopMargin, model: SolveModel, fs: number): number =>
+  m.params !== null ? predictedAttenuationDb(model, m.params, fs) : -Infinity;
+
+/** Below this a difference between two predictions is rounding, dB. */
+const PREDICTION_TOL_DB = 1e-6;
+
+/** One tonal solution before and after the stability margin (tonalSolution). */
+interface TonalCandidate {
+  /** The params the margin was enforced on: the solved delay/gain/polarity, with the trims and any centring raise. */
+  pre: EngineParams;
+  margin: LoopMargin;
+  /** Predicted attenuation once the margin is enforced (marginScore: −∞ refused). */
+  score: number;
+  /** Harmonics whose trims in effect were clamped (solveHarmonicTrims). */
+  capped: Set<number>;
+  /** Harmonics reconcileTrims gave the delay alone's response back. */
+  given?: Set<number>;
+}
+
+/** Rounds of reconcileTrims over the harmonics left worse than the delay alone (a uniform cut can make room for another). */
+const RECONCILE_ROUNDS = 3;
+/**
+ * reconcileTrims lowers every gain to give a harmonic back only for at least as much more in total as the cut, and at
+ * most this much, dB: a cut that moves every harmonic for less than it takes off them is not worth reporting, while a
+ * cut of a few 1e-5 dB that gives a harmonic back (seed 1105 zone R: 0.14 → 1.97 dB at h1) is.
+ */
+const GIVE_BACK_CUT_GAIN_DB = 0.05;
+/** Steps of reconcileTrims' lowering of a give-back's trims over the margin (secant steps: 2–3 usually reach it). */
+const TRIM_LOWER_PASSES = 8;
+/** Each secant step aims this much past the margin (a step short of it costs another pass). */
+const TRIM_LOWER_OVERSHOOT = 1.02;
+/** Least share of a step the loop is assumed to follow (a peak h's trims barely feed ends at the trims' floor). */
+const TRIM_LOWER_MIN_SHARE = 0.05;
+/** Up to this excess left after the steps is taken off every gain instead, dB (moves the other harmonics by as much). */
+const TRIM_LOWER_FINISH_DB = 0.02;
+
+/**
+ * Tonal mode: a trimmed candidate after its margin, reconciled harmonic by harmonic with the delay alone under its
+ * own margin (`ref`). The trims null each harmonic on its own, but then the margin cuts them (a null cut by a factor
+ * α leaves p·(1 − α)/(1 − α·T·ℓ): through the closed loop that can be louder than no trim), a uniform cut or the
+ * centring raise moves every harmonic, and the resonators' skirts carry each trim to the harmonics above
+ * tonal.harmonics, which the trims are not solved for (at a low Q, trims undid the delay's partial cancellation of
+ * the next harmonic: seed 169, 25 → −4 dB on the zone's loudest harmonic). On the params within the margin, then:
+ * a harmonic its trims leave worse than the delay alone gets the delay alone's response there back (trims that
+ * reproduce it on the candidate's gains, raise and cuts included, when inside the trims' range). When that takes the
+ * loop over the margin, those trims are lowered into it (secant steps, TRIM_LOWER_PASSES at most, the last
+ * TRIM_LOWER_FINISH_DB off every gain), unless lowering every gain by the excess instead predicts more in total by at
+ * least that cut (GIVE_BACK_CUT_GAIN_DB at most); up
+ * to RECONCILE_ROUNDS rounds (a uniform cut leaves the harmonics given back before it below the delay alone again).
+ * Then, one at a time, the harmonic whose trims cost the total most goes back to the delay alone's response (over the
+ * margin: with its trims lowered into it, or a uniform cut, when the total still gains), while that raises the total. A change is checked on its band, the neighbours' and the loop frequencies (the other bands
+ * barely move), the result on the whole loop; when that fails, again with every change checked on the whole loop.
+ * The harmonics given back take the delay alone's loop cuts (plus any lowering) and lose their capped flag; a
+ * uniform cut adds to the candidate's.
+ */
+function reconcileTrims(
+  cal: CalibrationData,
+  c: TonalCandidate,
+  ref: TonalCandidate,
+  model: SolveModel,
+  fs: number,
+  lc: LoopChecker | null,
+): TonalCandidate {
+  const start = c.margin.params;
+  const base = ref.margin.params;
+  if (start === null || base === null) return c;
+  const rows = trimmedHarmonics(start, model, fs).filter((r) => model.weights[r.k] > 0);
+  const chans = ([0, 1] as const).filter((ch) => start.channels[ch].enabled);
+  const { min, max } = RANGES.trimGainDb;
+  // The trims that give `x` the delay alone's response at harmonic h (null: outside the trims' range).
+  const back = (x: EngineParams, h: number): EngineParams | null => {
+    const y = clampParams(x);
+    for (const ch of chans) {
+      const r = base.channels[ch];
+      const gainDb = r.harmonicTrims[h - 1].gainDb + r.gainDb - x.channels[ch].gainDb;
+      if (!r.enabled || !(gainDb <= max + 1e-9 && gainDb >= min - 1e-9)) return null;
+      y.channels[ch].harmonicTrims[h - 1] = { gainDb: Math.min(max, Math.max(min, gainDb)), phaseDeg: r.harmonicTrims[h - 1].phaseDeg };
+    }
+    return y;
+  };
+  const bands = lc !== null ? trimLoopBands(cal, start, fs) : [];
+  const above = (db: number): boolean => db > LOOP_GAIN_DANGER_DB + LOOP_CAP_TOL_DB;
+  // The loop of x everywhere (bands and loop frequencies), dB above the margin (≤ 0: within it); with its loop gains.
+  const excess = (x: EngineParams): { db: number; gains: LoopGains } | null => {
+    if (lc === null) return null;
+    const gains = lc.gains(x);
+    return { db: Math.max(gains.afterDb, ...bands.map((b) => lc.bandPeak(x, b))) - LOOP_GAIN_DANGER_DB, gains };
+  };
+  const total = (x: EngineParams): number => predictedAttenuationDb(model, x, fs);
+  const point = (x: EngineParams, k: number): number => pointAttenuationDb(model, x, fs, k);
+  // How far the loop of x is above the margin around harmonic h (its band and the neighbours') and at the loop
+  // frequencies (where a uniform cut left the loop's peak at the margin), dB.
+  const nearExcess = (x: EngineParams, h: number): number =>
+    lc === null
+      ? -Infinity
+      : Math.max(lc.gains(x).afterDb, ...bands.filter((b) => Math.abs(b.h - h) <= 1).map((b) => lc.bandPeak(x, b))) - LOOP_GAIN_DANGER_DB;
+  // Harmonic h's trims of x lowered by db (null below the trims' floor).
+  const lowerTrims = (x: EngineParams, h: number, db: number): EngineParams | null => {
+    const y = clampParams(x);
+    for (const ch of chans) {
+      const t = y.channels[ch].harmonicTrims[h - 1];
+      if (t.gainDb - db < min) return null;
+      t.gainDb -= db;
+    }
+    return y;
+  };
+  interface Pass {
+    params: EngineParams;
+    /** Harmonics given the delay alone's response back, with the dB their trims were lowered further (and the loop before). */
+    done: Map<number, { loopDb: number; extraDb: number }>;
+    cutDb: number;
+  }
+  const pass = (whole: boolean): Pass => {
+    let x = start;
+    let cutDb = 0;
+    const done: Pass['done'] = new Map();
+    const over = (y: EngineParams, h: number): number => (whole ? (excess(y)?.db ?? -Infinity) : nearExcess(y, h));
+    const ok = (y: EngineParams, h: number): boolean => !(over(y, h) > LOOP_CAP_TOL_DB);
+    const tryBack = (h: number, k: number, cut: boolean): boolean => {
+      const y = back(x, h);
+      if (y === null) return false;
+      const loopDb = over(y, h);
+      if (!(loopDb > LOOP_CAP_TOL_DB)) {
+        x = y;
+        done.set(h, { loopDb: Number.NaN, extraDb: 0 });
+        return true;
+      }
+      if (!cut) return false;
+      // The loop over the margin: the trims given back lowered by the excess (the loop around h follows them, a few
+      // passes), or every gain lowered by it when that predicts GIVE_BACK_CUT_GAIN_DB more in total.
+      // Each step is the excess over the share of it the last step removed (a secant: when h's trims feed only part of
+      // the peak, equal steps would close in on the margin geometrically and stop just above it), a little more.
+      // What the steps leave over the margin (a peak h's trims barely feed: hundredths of a dB) comes off every gain.
+      let w: EngineParams | null = y;
+      let extraDb = 0;
+      let share = 1;
+      let left = loopDb;
+      for (let i = 0; i < TRIM_LOWER_PASSES && w !== null && left > LOOP_CAP_TOL_DB; i++) {
+        const step = (left / share) * TRIM_LOWER_OVERSHOOT + LOOP_CAP_TOL_DB / 2;
+        w = lowerTrims(w, h, step);
+        extraDb += step;
+        const now = w !== null ? over(w, h) : Infinity;
+        share = Math.min(1, Math.max(TRIM_LOWER_MIN_SHARE, (left - now) / step));
+        left = now;
+      }
+      const finishDb = w !== null && left > LOOP_CAP_TOL_DB && left <= TRIM_LOWER_FINISH_DB ? left + LOOP_CAP_TOL_DB / 2 : 0;
+      if (finishDb > 0) w = lowerGains(w!, finishDb);
+      // (Lowered, they no longer reproduce the delay alone: kept only when the total does not lose by it, seed 575.)
+      const lowered =
+        w !== null && ok(w, h) && point(w, k) > point(x, k) + PREDICTION_TOL_DB && total(w) >= total(x) - PREDICTION_TOL_DB ? w : null;
+      const best = Math.max(total(x), lowered !== null ? total(lowered) : -Infinity);
+      // (A cut that would leave no more than the best before it is not worth the whole-loop check.)
+      const all = total(y) > best + PREDICTION_TOL_DB ? excess(y) : null;
+      const allDb = all !== null && all.db > 0 ? all.db + LOOP_CAP_TOL_DB / 2 : 0;
+      const z = allDb > 0 ? lowerGains(y, allDb) : null;
+      if (z !== null && total(z) >= best + Math.min(GIVE_BACK_CUT_GAIN_DB, allDb) && total(z) > best + PREDICTION_TOL_DB && ok(z, h)) {
+        x = z;
+        cutDb += allDb;
+        done.set(h, { loopDb: Number.NaN, extraDb: 0 });
+        return true;
+      }
+      if (lowered === null) return false;
+      x = lowered;
+      cutDb += finishDb;
+      done.set(h, { loopDb: loopDb + LOOP_GAIN_DANGER_DB, extraDb });
+      return true;
+    };
+    const fixWorse = (): void => {
+      for (let round = 0, changed = true; changed && round < RECONCILE_ROUNDS; round++) {
+        changed = false;
+        for (const { h, k } of rows) {
+          if (point(x, k) < point(base, k) - PREDICTION_TOL_DB && tryBack(h, k, true)) changed = true;
+        }
+      }
+    };
+    fixWorse();
+    const tried = new Set(done.keys());
+    for (;;) {
+      const now = total(x);
+      let best: { h: number; k: number; gain: number } | null = null;
+      for (const { h, k } of rows) {
+        const y = tried.has(h) ? null : back(x, h);
+        const gain = y !== null ? total(y) - now : 0;
+        if (gain > PREDICTION_TOL_DB && (best === null || gain > best.gain)) best = { h, k, gain };
+      }
+      if (best === null) break;
+      tried.add(best.h);
+      if (tryBack(best.h, best.k, false)) continue;
+      // Over the margin: with its trims lowered into it or a uniform cut, when the total still gains by it (seed 575:
+      // h7 back after h3, 1.81 → 2.13 dB).
+      // A cut or lowered trims can leave a harmonic given back before below the delay alone again: those first.
+      const before = { x, cutDb, done: new Map(done) };
+      if (!tryBack(best.h, best.k, true)) continue;
+      if (total(x) > now + PREDICTION_TOL_DB) {
+        fixWorse();
+        if (total(x) > now + PREDICTION_TOL_DB) continue;
+      }
+      x = before.x;
+      cutDb = before.cutDb;
+      done.clear();
+      for (const [h, d] of before.done) done.set(h, d);
+    }
+    return { params: x, done, cutDb };
+  };
+  let r = pass(false);
+  if (r.done.size === 0) return c;
+  let e = excess(r.params);
+  if (e !== null && above(e.db + LOOP_GAIN_DANGER_DB)) {
+    r = pass(true);
+    if (r.done.size === 0) return c;
+    e = excess(r.params);
+  }
+  // Loop cuts: the delay alone's on the harmonics given back, plus what their trims were lowered further.
+  const trims = new Map<number, TrimLoopLimit>();
+  for (const [h, t] of c.margin.trims) if (!r.done.has(h)) trims.set(h, t);
+  for (const [h, d] of r.done) {
+    const t = ref.margin.trims.get(h);
+    const loweredDb = (t?.loweredDb ?? 0) + d.extraDb;
+    if (loweredDb > LOOP_CAP_TOL_DB) trims.set(h, { loopDb: t?.loopDb ?? d.loopDb, loweredDb });
+  }
+  const limitedDb = c.margin.limitedDb + r.cutDb;
+  const final = e?.gains ?? null;
+  return {
+    pre: c.pre,
+    margin: { params: r.params, trims, rest: e !== null ? restOf(e, limitedDb) : c.margin.rest, limitedDb, final },
+    score: total(r.params),
+    capped: new Set([...c.capped].filter((h) => !r.done.has(h))),
+    given: new Set([...(c.given ?? []), ...r.done.keys()]),
+  };
+}
+
+/**
+ * The loop a uniform cut of `limitedDb` acts on, from the loop of the params after it (`e`: its whole-loop excess,
+ * bands included, and its loop gains): scaled back up by the cut (the loop scales with the gains). With no cut, the
+ * loop itself.
+ */
+function restOf(e: { db: number; gains: LoopGains }, limitedDb: number): LoopGains {
+  const up = limitedDb > 0 ? limitedDb : 0;
+  return { rawDb: e.gains.rawDb + up, atHz: e.gains.atHz, afterDb: Math.max(e.gains.afterDb, e.db + LOOP_GAIN_DANGER_DB) + up };
+}
+
+/**
+ * Tonal mode: a candidate's uniform gain cut given back as far as its loop now allows (reconcileTrims' give-backs, a
+ * trim at its floor or the per-harmonic margin's give-backs can leave the whole loop below the margin with the cut
+ * still in place: seed 211, 10.6 dB where 11.3 dB fit), when that predicts more in total. Every channel gain is raised
+ * by the slack (the loop scales with them, so it lands at the margin) or by the whole cut; the harmonics given the
+ * delay alone's response back (`given`) keep it when their trims can be lowered by as much (else the plain raise).
+ * Checked on the whole loop; with `ref`, the delay alone a candidate was reconciled with, a raise that would leave a
+ * harmonic below the delay alone's response (it was not) is not made (seed 123, h3). The loop the cut acts on is then
+ * restated from the loop returned (restOf).
+ */
+function reclaimCut(
+  cal: CalibrationData,
+  c: TonalCandidate,
+  model: SolveModel,
+  fs: number,
+  lc: LoopChecker | null,
+  ref: TonalCandidate | null = null,
+): TonalCandidate {
+  const x = c.margin.params;
+  if (x === null || lc === null || !(c.margin.limitedDb > 0)) return c;
+  // With `ref` (the delay alone, for a reconciled candidate): no harmonic at or above its response may fall below it.
+  const base = ref?.margin.params ?? null;
+  const rows = base !== null ? trimmedHarmonics(x, model, fs).filter((r) => model.weights[r.k] > 0) : [];
+  const point = (y: EngineParams, k: number): number => pointAttenuationDb(model, y, fs, k);
+  const kept = rows.filter((r) => point(x, r.k) >= point(base!, r.k) - PREDICTION_TOL_DB);
+  const fair = (y: EngineParams): boolean => kept.every((r) => point(y, r.k) >= point(base!, r.k) - PREDICTION_TOL_DB);
+  const bands = trimLoopBands(cal, x, fs);
+  const excess = (y: EngineParams): { db: number; gains: LoopGains } => {
+    const gains = lc.gains(y);
+    return { db: Math.max(gains.afterDb, ...bands.map((b) => lc.bandPeak(y, b))) - LOOP_GAIN_DANGER_DB, gains };
+  };
+  const now = excess(x);
+  const up = Math.min(c.margin.limitedDb, -now.db - LOOP_CAP_TOL_DB / 2);
+  if (!(up > (up === c.margin.limitedDb ? 0 : LOOP_CAP_TOL_DB))) return c;
+  const chans = ([0, 1] as const).filter((ch) => x.channels[ch].enabled);
+  if (chans.some((ch) => x.channels[ch].gainDb + up > RANGES.gainDb.max)) return c;
+  const raised = lowerGains(x, -up)!;
+  const variants = [raised];
+  if (c.given !== undefined && c.given.size > 0) {
+    const same = clampParams(raised);
+    let fits = true;
+    for (const h of c.given) {
+      for (const ch of chans) {
+        const t = same.channels[ch].harmonicTrims[h - 1];
+        if (t.gainDb - up < RANGES.trimGainDb.min) fits = false;
+        else t.gainDb -= up;
+      }
+    }
+    if (fits) variants.unshift(clampParams(same));
+  }
+  // The whole cut given back is kept unless it predicts less (a cut that buys nothing is not reported as one).
+  const whole = up === c.margin.limitedDb;
+  let best: { params: EngineParams; score: number; e: { db: number; gains: LoopGains } } | null = null;
+  for (const y of variants) {
+    const score = predictedAttenuationDb(model, y, fs);
+    const enough = whole ? score >= c.score - PREDICTION_TOL_DB : score > c.score + PREDICTION_TOL_DB;
+    if (!enough || (best !== null && !(score > best.score + PREDICTION_TOL_DB)) || !fair(y)) continue;
+    const e = excess(y);
+    if (e.db > LOOP_CAP_TOL_DB) continue;
+    best = { params: y, score, e };
+  }
+  if (best === null) return c;
+  const limitedDb = c.margin.limitedDb - up > LOOP_CAP_TOL_DB ? c.margin.limitedDb - up : 0;
+  return {
+    ...c,
+    margin: { ...c.margin, params: best.params, limitedDb, rest: restOf(best.e, limitedDb), final: best.e.gains },
+    score: best.score,
+  };
+}
+
+/**
+ * Tonal mode: the solved delay/gain/polarity `bare` (no trims) with per-harmonic trims, under the stability margin.
+ * Candidates, each judged after its own best margin (bestLoopMargin): the trims with the centring raise and, when a
+ * raise was made, without it (solveHarmonicTrims), each reconciled with the delay alone (reconcileTrims); and the
+ * delay alone itself, untrimmed and without a raise. The one that predicts most in total is kept (the raise, then
+ * the delay alone, only when strictly better): a tonal solve never predicts less than its delay alone under the
+ * same rules. Returns the candidate kept and the delay alone (SolveOutcome.delayOnly, the reference of
+ * HarmonicSolution.untrimmedDb).
+ */
+function tonalSolution(
+  cal: CalibrationData,
+  bare: EngineParams,
+  model: SolveModel,
+  fs: number,
+  taps: number,
+): { chosen: TonalCandidate; delayOnly: TonalCandidate } {
+  const lc = loopChecker(cal, bare, fs, taps);
+  const judge = (t: { params: EngineParams; capped: Set<number> }): TonalCandidate => {
+    const margin = bestLoopMargin(cal, t.params, fs, taps, model, lc);
+    return { pre: t.params, margin, score: marginScore(margin, model, fs), capped: t.capped };
+  };
+  const delayOnly = reclaimCut(cal, judge({ params: bare, capped: new Set() }), model, fs, lc);
+  const raised = solveHarmonicTrims(bare, model, cal.speakers, fs, true);
+  const trimmed = [raised];
+  // The centring raise costs loop gain at the harmonic it serves and lifts the harmonics above the trimmed ones:
+  // the trims without it are a candidate too.
+  if (([0, 1] as const).some((ch) => raised.params.channels[ch].gainDb !== bare.channels[ch].gainDb)) {
+    trimmed.unshift(solveHarmonicTrims(bare, model, cal.speakers, fs, false));
+  }
+  let chosen: TonalCandidate | null = null;
+  for (const t of trimmed) {
+    const c = reclaimCut(cal, reconcileTrims(cal, judge(t), delayOnly, model, fs, lc), model, fs, lc, delayOnly);
+    if (chosen === null || c.score > chosen.score + PREDICTION_TOL_DB) chosen = c;
+  }
+  if (delayOnly.score > chosen!.score + PREDICTION_TOL_DB) chosen = delayOnly;
+  return { chosen: chosen!, delayOnly };
+}
+
+/** Below this a uniform cut is not what leaves a solve useless, dB (it moves the prediction by hundredths at most). */
+const NEGLIGIBLE_CUT_DB = 0.05;
+
+/**
+ * Whether the uniform cut of a margin is what leaves its params below MIN_USEFUL_DB: the gains would fall below their
+ * range, or the cut is at least NEGLIGIBLE_CUT_DB. Otherwise a refusal is about the attenuation («non si ottiene
+ * attenuazione»), not a howl risk: seed 21 was refused as «Rischio di innesco … ridotti di 0,0 dB» for a cut of
+ * 1e-4 dB with its loop already at the margin. (Without the cut the loop is over the margin: its prediction says
+ * nothing.)
+ */
+const cutRefuses = (m: LoopMargin): boolean => m.params === null || m.limitedDb >= NEGLIGIBLE_CUT_DB;
+
 /**
  * Converts the solution into params, then enforces the loop's stability margin: the loop through the
  * measured feedback paths, after the neutralisation FIRs the app loads, must stay at or below
- * LOOP_GAIN_DANGER_DB (6 dB of margin) everywhere in band. Above it every channel gain is lowered by
- * the excess (the loop scales with them); when that leaves no useful attenuation the params are not
- * changed. Between LOOP_GAIN_LIMIT_DB (the plan's −20 dB target) and the margin the params stay and the
- * advice says the cancellation is less accurate: near the band edges a FIR of a few ms cannot model a
- * band-limited path, so enforcing −20 dB there would throw away working solutions. The predicted
- * attenuation is recomputed for the params returned (see predictedAttenuationDb).
+ * LOOP_GAIN_DANGER_DB (6 dB of margin) everywhere in band (enforceLoopMargin: in tonal mode the trims of the
+ * harmonics above it first, then every channel gain by what is left; tonal mode compares the trims with the delay
+ * alone, see tonalSolution); when that leaves no useful attenuation the params are not changed, and the outcome's
+ * result carries the prediction refused (below 1 dB: never a useful outcome). Between LOOP_GAIN_LIMIT_DB (the plan's
+ * −20 dB target) and the margin the params stay and the advice says the cancellation is less accurate: near the band
+ * edges a FIR of a few ms cannot model a band-limited path, so enforcing −20 dB there would throw away working
+ * solutions. The predicted attenuation is recomputed for the params returned, through the closed loop (see
+ * predictedAttenuationDb).
  */
 function finishSolve(
   cal: CalibrationData,
@@ -1457,55 +2529,85 @@ function finishSolve(
   fs: number,
   result: AlignmentResult,
   advice: string[],
-  model: SolveModel,
+  solved: SolveModel,
   taps: number,
 ): SolveOutcome {
+  // Predictions and trims through the closed loop the app runs (the neutralisers feedbackFirs(cal, taps) designs).
+  const model = withFeedback(solved, cal, fs, taps);
   const res: AlignmentResult = { ...result, channels: [{ ...result.channels[0] }, { ...result.channels[1] }] };
-  const unchanged = (loop: LoopGains | null, limited = 0): SolveOutcome => ({
-    params: p,
-    result: res,
-    advice,
-    loopGainDb: loop?.rawDb ?? null,
-    loopGainAfterDb: loop?.afterDb ?? null,
-    loopLimitedDb: limited,
-  });
-  if (!(res.predictedAttenuationDb >= MIN_USEFUL_DB)) {
+  // The params stay as they were: the result carries the prediction that was refused (the advice quotes it).
+  const unchanged = (loop: LoopGains | null, predictedDb: number, limited = 0): SolveOutcome => {
+    res.predictedAttenuationDb = predictedDb;
+    return {
+      params: p,
+      result: res,
+      advice,
+      loopGainDb: loop?.rawDb ?? null,
+      loopGainAfterDb: loop?.afterDb ?? null,
+      loopLimitedDb: limited,
+    };
+  };
+  const nothing = (predictedDb: number): SolveOutcome => {
     // Nothing to gain: do not load a meaningless delay/gain into the engine.
-    advice.push(
-      `Con queste misure non si ottiene attenuazione (prevista ${fmt(res.predictedAttenuationDb)} dB): ` +
-        'i parametri non sono stati cambiati.',
-    );
+    advice.push(`Con queste misure non si ottiene attenuazione (prevista ${fmt(predictedDb)} dB): i parametri non sono stati cambiati.`);
     const loop = loopGains(cal, p, fs, taps);
     if (loop !== null) loopAdvice(loop, taps, advice);
-    return unchanged(loop);
-  }
+    return unchanged(loop, predictedDb);
+  };
+  const tonal = p.phaseMode === 'tonal' && res.channels.some((c) => c.use);
+  if (!tonal && !(res.predictedAttenuationDb >= MIN_USEFUL_DB)) return nothing(res.predictedAttenuationDb);
   const conv = solutionToParams(p, res, fs);
+  let margin: LoopMargin;
+  let capped = new Set<number>();
+  // Tonal mode: the delay alone under its own margin, what the trims are compared with.
+  let delayOnly: TonalCandidate | null = null;
+  if (tonal) {
+    // Per-harmonic trims on top of the delay/gain solution; usefulness, margin and prediction are judged on the
+    // candidate kept.
+    const t = tonalSolution(cal, withoutTrims(conv.params), model, fs, taps);
+    if (!(t.chosen.score >= MIN_USEFUL_DB) && !cutRefuses(t.chosen.margin)) return nothing(t.chosen.score);
+    for (const ch of [0, 1] as const) {
+      const g = t.chosen.pre.channels[ch].gainDb;
+      if (g === conv.params.channels[ch].gainDb) continue;
+      // The trims raised this gain (centring): the amplifier advice is about the gain actually used.
+      const head = `Canale ${CH_NAME[ch]}: serve un guadagno di`;
+      conv.advice = conv.advice.filter((a) => !a.startsWith(head));
+      const amp = amplifierAdvice(ch, g);
+      if (amp !== null) conv.advice.push(amp);
+    }
+    conv.params = t.chosen.pre;
+    margin = t.chosen.margin;
+    capped = t.chosen.capped;
+    delayOnly = t.delayOnly;
+  } else {
+    // Trims are relative to the delay/gain they were solved with: a new solution starts without them.
+    conv.params = withoutTrims(conv.params);
+    margin = bestLoopMargin(cal, conv.params, fs, taps, model);
+  }
   advice.push(...conv.advice);
-  let params = conv.params;
-  const loop = loopGains(cal, params, fs, taps);
-  let limited = 0;
-  if (loop !== null && loop.afterDb > LOOP_GAIN_DANGER_DB) {
-    limited = loop.afterDb - LOOP_GAIN_DANGER_DB;
-    const lowered = lowerGains(params, limited);
-    const predicted = lowered !== null ? predictedAttenuationDb(model, lowered, fs) : 0;
-    if (lowered === null || !(predicted >= MIN_USEFUL_DB)) {
-      res.predictedAttenuationDb = predicted;
+  // The loop the uniform part of the margin acts on: after any per-harmonic trim cut.
+  const loop = margin.rest;
+  const limited = margin.limitedDb;
+  const params = margin.params ?? conv.params;
+  if (loop !== null && limited > 0) {
+    const predicted = margin.params !== null ? predictedAttenuationDb(model, margin.params, fs) : 0;
+    if (!(predicted >= MIN_USEFUL_DB) && !cutRefuses(margin)) return nothing(predicted);
+    if (margin.params === null || !(predicted >= MIN_USEFUL_DB)) {
       advice.push(
         `Rischio di innesco: il guadagno d'anello cassa → microfono di riferimento è ${fmt(loop.rawDb)} dB a ` +
           `${fmt(loop.atHz, 0)} Hz e resta ${fmt(loop.afterDb)} dB anche con la neutralizzazione del feedback. Per ` +
-          `scendere a ${fmt(LOOP_GAIN_DANGER_DB, 0)} dB i guadagni andrebbero ridotti di ${fmt(limited)} dB e l'anti-rumore ` +
+          `scendere a ${fmt(LOOP_GAIN_DANGER_DB, 0)} dB i guadagni andrebbero ridotti di ${fmtCut(limited)} dB e l'anti-rumore ` +
           'non attenuerebbe più: i parametri non sono stati cambiati. Allontana o orienta la cassa lontano dal ' +
           `microfono di riferimento${tapsAdvice(taps)}, poi ripeti la misura dei percorsi.`,
       );
-      return unchanged(loop, limited);
+      return unchanged(loop, predicted, limited);
     }
-    params = lowered;
     const k = dbToAmp(-limited);
     for (const c of res.channels) c.gainLin *= k;
     advice.push(
       `Guadagno d'anello cassa → microfono di riferimento ${fmt(loop.rawDb)} dB a ${fmt(loop.atHz, 0)} Hz, ` +
         `${fmt(loop.afterDb)} dB dopo la neutralizzazione del feedback: sopra ${fmt(LOOP_GAIN_DANGER_DB, 0)} dB non resta ` +
-        `margine di stabilità. Guadagni dei canali ridotti di ${fmt(limited)} dB; per recuperare attenuazione allontana o ` +
+        `margine di stabilità. Guadagni dei canali ridotti di ${fmtCut(limited)} dB; per recuperare attenuazione allontana o ` +
         `orienta la cassa lontano dal microfono di riferimento${tapsAdvice(taps)}.`,
     );
   } else if (loop !== null) {
@@ -1517,23 +2619,98 @@ function finishSolve(
       `Con i valori applicabili non si ottiene attenuazione (prevista ${fmt(res.predictedAttenuationDb)} dB): ` +
         'i parametri non sono stati cambiati.',
     );
-    return unchanged(loop, limited);
+    return unchanged(loop, res.predictedAttenuationDb, limited);
   }
-  if (res.channels.some((c) => c.use) && res.predictedAttenuationDb < WEAK_ATTENUATION_DB) {
-    advice.push(
-      `Attenuazione prevista solo ${fmt(res.predictedAttenuationDb)} dB: controlla posizionamento, ` +
-        'banda dei filtri e causalità prima di attivare l\'uscita.',
-    );
-  }
-  // The loop scales with the gains: the values of the params returned.
-  return {
+  const weak = res.channels.some((c) => c.use) ? weakAttenuationAdvice(res.predictedAttenuationDb) : null;
+  if (weak !== null) advice.push(weak);
+  const out: SolveOutcome = {
     params,
     result: res,
     advice,
-    loopGainDb: loop !== null ? loop.rawDb - limited : null,
-    loopGainAfterDb: loop !== null ? loop.afterDb - limited : null,
+    // The values of the params returned.
+    loopGainDb: margin.final?.rawDb ?? null,
+    loopGainAfterDb: margin.final?.afterDb ?? null,
     loopLimitedDb: limited,
   };
+  const ceiling = predictionCeiling(res.predictedAttenuationDb, model.coherence !== null);
+  if (ceiling !== null) out.predictionCeiling = ceiling;
+  const delayParams = delayOnly?.margin.params ?? null;
+  if (tonal) {
+    if (delayParams !== null) out.delayOnly = { params: clampParams(delayParams), predictedDb: delayOnly!.score };
+    out.harmonics = harmonicSolutions(params, model, fs, capped, margin.trims, delayParams);
+    for (const a of [cappedAdvice(out.harmonics), loopTrimAdvice(out.harmonics, margin.trims, taps, limited)]) if (a !== null) advice.push(a);
+  }
+  outcomeModels.set(out, { model, fs, solved: params, delayOnly: delayParams });
+  return out;
+}
+
+/**
+ * The model each applied outcome was solved and predicted with (predictOutcome), with the params returned and, in
+ * tonal mode, the delay alone under its own margin (null: refused, or outside tonal mode); outcomes stay plain data.
+ */
+const outcomeModels = new WeakMap<SolveOutcome, { model: SolveModel; fs: number; solved: EngineParams; delayOnly: EngineParams | null }>();
+
+/**
+ * The delay alone of an outcome (`delayOnly`, kept with the outcome's params `solved`) on other params `p` (separate
+ * zones merged): each of the outcome's channels gets the delay alone's values with the change of gain `p` made to
+ * it (the merged cut); the other channels are `p`'s.
+ */
+function delayOnlyOn(delayOnly: EngineParams, solved: EngineParams, p: EngineParams): EngineParams {
+  const q = clampParams(p);
+  const d = clampParams(delayOnly);
+  for (const ch of [0, 1] as const) {
+    if (!solved.channels[ch].enabled || !q.channels[ch].enabled) continue;
+    const moved = q.channels[ch].gainDb - solved.channels[ch].gainDb;
+    q.channels[ch] = { ...d.channels[ch], gainDb: moved !== 0 ? d.channels[ch].gainDb + moved : d.channels[ch].gainDb };
+  }
+  return clampParams(q);
+}
+
+/** What predictOutcome gives: an applied outcome's predictions on other params. */
+export interface OutcomePrediction {
+  predictedDb: number;
+  predictionCeiling: PredictionCeiling | null;
+  harmonics?: HarmonicSolution[];
+  /**
+   * Tonal mode: the outcome's delay alone (SolveOutcome.delayOnly) moved onto the params (its channels with their change
+   * of gain), and its prediction; absent without one, and when the params predicted are the delay alone already.
+   */
+  delayOnly?: { params: EngineParams; predictedDb: number };
+}
+
+/**
+ * An applied outcome's predictions recomputed for other params `p` (same f0 and harmonics) with its own model —
+ * separate zones: the merged params, both speakers playing. Each zone is solved with its own speaker alone, but
+ * its model holds both neutralised feedback paths: with both channels on, the zone's anti-noise goes through the
+ * closed loop 1/(1 − L₀ − L₁), the other speaker's feedback included (its secondary path into this zone is not
+ * modelled: none was measured). A zone the other speaker's feedback undoes is then predicted as such, not as
+ * the exact null of its own solve. Per harmonic, the outcome's capped and loop-limited flags are kept, and
+ * untrimmedDb is the outcome's delay alone moved onto `p` (its channels with p's change of gain): on the outcome's
+ * own params, the outcome's figures. `delayAlone`: `p` carries the outcome's delay alone on its channels (the
+ * `delayOnly` this returns, capped again): no trims of the outcome's are flagged, a channel's negative trims are the
+ * delay alone's own loop cuts, and untrimmedDb is `p`'s. Null for an outcome the solvers did not apply (no model).
+ */
+export function predictOutcome(o: SolveOutcome, p: EngineParams, delayAlone = false): OutcomePrediction | null {
+  const m = outcomeModels.get(o);
+  if (m === undefined) return null;
+  const predictedDb = predictedAttenuationDb(m.model, p, m.fs);
+  const out: OutcomePrediction = { predictedDb, predictionCeiling: predictionCeiling(predictedDb, m.model.coherence !== null) };
+  if (o.harmonics !== undefined) {
+    const capped = new Set(delayAlone ? [] : o.harmonics.filter((x) => x.capped).map((x) => x.h));
+    const lowered = new Map<number, TrimLoopLimit>();
+    if (!delayAlone) {
+      for (const x of o.harmonics) if (x.loopLimitedDb !== undefined) lowered.set(x.h, { loopDb: Number.NaN, loweredDb: x.loopLimitedDb });
+    } else {
+      for (const x of o.harmonics) {
+        const cut = Math.max(0, ...([0, 1] as const).filter((ch) => m.solved.channels[ch].enabled && p.channels[ch].enabled).map((ch) => -p.channels[ch].harmonicTrims[x.h - 1].gainDb));
+        if (cut > LOOP_CAP_TOL_DB) lowered.set(x.h, { loopDb: Number.NaN, loweredDb: cut });
+      }
+    }
+    const delayOnly = delayAlone ? p : m.delayOnly !== null ? delayOnlyOn(m.delayOnly, m.solved, p) : null;
+    out.harmonics = harmonicSolutions(p, m.model, m.fs, capped, lowered, delayOnly);
+    if (!delayAlone && delayOnly !== null) out.delayOnly = { params: delayOnly, predictedDb: predictedAttenuationDb(m.model, delayOnly, m.fs) };
+  }
+  return out;
 }
 
 const unusable = (p: EngineParams, msg: string): SolveOutcome => ({ params: p, result: noResult(), advice: [msg], loopGainDb: null });
@@ -1743,7 +2920,7 @@ export function solveFromCalibration(cal: CalibrationData, params: EngineParams,
   if (prim.tonalF0 !== null && p.phaseMode !== 'tonal') {
     advice.push(`Il rumore ha un tono dominante a ${fmt(prim.tonalF0, 2)} Hz: la modalità tonale può attenuarlo di più.`);
   }
-  const model: SolveModel = { freqs: primary.freqs, primary, secondary, weights: gxx, coherence, band: cal.band };
+  const model: SolveModel = { freqs: primary.freqs, primary, secondary, weights: gxx, coherence, band: cal.band, feedback: null };
   return finishSolve(cal, p, fs, result, advice, model, tapsOf(opts));
 }
 
@@ -1865,7 +3042,7 @@ export function solveFromGeometry(cal: CalibrationData, params: EngineParams, fs
     "Senza microfono d'errore il risultato non è misurabile: verifica all'ascolto e, se puoi, rifinisci con il " +
       "microfono d'errore e l'autotune.",
   );
-  const model: SolveModel = { freqs, primary, secondary, weights, coherence: null, band };
+  const model: SolveModel = { freqs, primary, secondary, weights, coherence: null, band, feedback: null };
   return finishSolve(cal, p, fs, result, advice, model, tapsOf(opts));
 }
 
